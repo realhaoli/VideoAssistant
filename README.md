@@ -135,6 +135,8 @@ TASK_WORKERS=2
 
 默认数据目录相对于项目根目录，不随终端工作目录改变。可在 `variables.env` 设置 `MEDIA_DATA_DIR`，例如 `MEDIA_DATA_DIR=D:/VideoAssistantData` 或 `MEDIA_DATA_DIR=workspace-data`。Windows 配置路径建议使用 `/`；路径可以包含空格和中文。Chromium 默认安装到该数据目录的 `browser/`，也可用 `PLAYWRIGHT_BROWSERS_PATH` 单独覆盖；变更路径后重新运行 `start-local.py --install-browser`。
 
+Windows 数据目录建议放在本机 NTFS 分区，以支持下载中的文件与新生成文件之间的原子替换；已有下载保持读取原来的内容，新下载读取更新后的文件。
+
 ### 4. 准备 Whisper small
 
 Windows 使用 `.\.venv\Scripts\python.exe scripts/prepare-whisper.py`；macOS / Linux 使用：
