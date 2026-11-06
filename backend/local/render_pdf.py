@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,4 +42,5 @@ async def render(source, target):
 
 
 if __name__ == '__main__':
-    asyncio.run(asyncio.wait_for(render(Path(sys.argv[1]), Path(sys.argv[2])), timeout=120))
+    timeout = max(60, min(600, int(os.getenv('PDF_TIMEOUT_SECONDS', '300'))))
+    asyncio.run(asyncio.wait_for(render(Path(sys.argv[1]), Path(sys.argv[2])), timeout=timeout))

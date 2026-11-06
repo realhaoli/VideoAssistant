@@ -77,6 +77,10 @@ class ModelSettings(BaseModel):
     use_vlm: bool = True
     whisper_model: str = "small"
     whisper_device: str = "auto"
+    llm_context_tokens: int = Field(32768, ge=2048, le=2_000_000)
+    vlm_context_tokens: int = Field(32768, ge=2048, le=2_000_000)
+    llm_max_output_tokens: int = Field(8192, ge=256, le=131072)
+    vlm_max_output_tokens: int = Field(8192, ge=256, le=131072)
 
 
 @secured.put("/settings")

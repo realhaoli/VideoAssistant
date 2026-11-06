@@ -67,6 +67,13 @@ const canSubmit = computed(
 const progressText = (message = "") => message.replace(/Whisper\s+(?:large-v3-turbo|large-v3|medium|small|base|tiny)\s+(?=转写|本地转写)/g, "Whisper ");
 const stageProgressText = computed(() => {
   const task = activeTask.value;
+  const running = Object.values(task?.output_states || {}).filter(output => output.status === 'running');
+  const stages = [...new Set(running.map(output => output.message).filter(Boolean))];
+  if (stages.length > 1) return '并行处理：' + stages.join(' / ');
+  if (running.length && stages.length === 1) {
+    const value = running[0].stage_progress;
+    return progressText(stages[0]).replace(/[\s，,]*\d+(?:\.\d+)?%$/, '') + (typeof value === 'number' ? `，${Math.round(value)}%` : '');
+  }
   const message = progressText(task?.message || "等待处理");
   if (typeof task?.stage_progress === "number" && Number.isFinite(task.stage_progress)) {
     const label = message.replace(/[\s，,]*\d+(?:\.\d+)?%$/, "");
@@ -77,8 +84,10 @@ const stageProgressText = computed(() => {
 const statusName = (state) =>
   ({
     queued: "等待处理",
+    pending: "等待处理",
     running: "处理中",
     completed: "已完成",
+    partial: "部分完成",
     failed: "处理失败",
     cancelled: "已取消",
     cancelling: "取消中",
@@ -669,12 +678,18 @@ onBeforeUnmount(() => clearInterval(timer));
             :show-text="false"
             color="#409eff"
           />
+          <div v-if="activeTask.output_states" class="output-progress-list">
+            <div v-for="feature in features.filter(item => activeTask.modes.includes(item.id))" :key="feature.id" class="output-progress-item">
+              <div><strong>{{ feature.name }}</strong><span class="status-badge" :class="activeTask.output_states[feature.id]?.status">{{ statusName(activeTask.output_states[feature.id]?.status || 'pending') }}</span><small>产物进度：{{ activeTask.output_states[feature.id]?.progress || 0 }}%</small></div>
+              <p>{{ progressText(activeTask.output_states[feature.id]?.message || '等待处理') }}<span v-if="activeTask.output_states[feature.id]?.error"> · {{ activeTask.output_states[feature.id].error }}</span></p>
+            </div>
+          </div>
           <p v-if="activeTask.error" class="error-text">
             {{ activeTask.error }}
           </p>
-          <div v-if="['failed', 'cancelled', 'queued', 'running'].includes(activeTask.status)" class="task-controls">
+          <div v-if="['failed', 'partial', 'cancelled', 'queued', 'running'].includes(activeTask.status)" class="task-controls">
             <button
-              v-if="['failed', 'cancelled'].includes(activeTask.status)"
+              v-if="['failed', 'partial', 'cancelled'].includes(activeTask.status)"
               class="secondary small"
               @click="action(activeTask, 'retry')"
             >
@@ -825,6 +840,11 @@ onBeforeUnmount(() => clearInterval(timer));
                 :placeholder="settings.vlm_key_configured ? settings.vlm_key_mask : '请输入 API Key'"
             /></label></div
         ></template>
+        <details class="model-budgets"><summary>模型容量限制</summary>
+          <div class="model-two"><label>语言模型上下文（token）<input type="number" min="2048" max="2000000" v-model.number="models.llm_context_tokens" /></label><label>语言模型最大输出（token）<input type="number" min="256" max="131072" v-model.number="models.llm_max_output_tokens" /></label></div>
+          <div class="model-two"><label>多模态上下文（token）<input type="number" min="2048" max="2000000" v-model.number="models.vlm_context_tokens" /></label><label>多模态最大输出（token）<input type="number" min="256" max="131072" v-model.number="models.vlm_max_output_tokens" /></label></div>
+          <p class="device-note">1M 上下文可填 1000000；最大输出请按具体模型设置，两者并不相同。</p>
+        </details>
         <h3>本地语音识别</h3>
         <div class="model-two">
           <label

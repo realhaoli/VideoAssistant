@@ -9,12 +9,13 @@ import pytest
 from local.jobs import JobStore
 
 
-@pytest.mark.parametrize('status', ['completed', 'failed', 'cancelled'])
+@pytest.mark.parametrize('status', ['completed', 'partial', 'failed', 'cancelled'])
 def test_history_and_downloads_survive_repeated_restarts(tmp_path, status):
     jobs = JobStore(tmp_path/'data/tasks')
     task = jobs.create(modes=['text'], source={'type':'upload','filename':'source.mp4'}, options={}, title='历史任务😀', enqueue=False)
     jobs.rename(task['id'], '保留的自定义名称')
     jobs.update(task['id'], status=status, stage='report', progress=70, stage_progress=50)
+    jobs.update_output(task['id'],'text',status='completed',progress=100,message='已完成')
     folder = jobs.directory(task['id'])/'output'
     folder.mkdir()
     (folder/'text.md').write_text('已有汇报结果', encoding='utf-8')
@@ -26,6 +27,7 @@ def test_history_and_downloads_survive_repeated_restarts(tmp_path, status):
             current = restored.get(task['id'])
             assert current['status'] == status and current['custom_title'] == '保留的自定义名称'
             assert current['progress'] == 70 and current['stage_progress'] == 50
+            assert current['output_states']['text']['status']=='completed'
             assert restored.history_status() == {'task_count':1,'recovered_tasks':0,'unreadable_tasks':0}
             with restored.open_resource(task['id'], 'text.md') as stream:
                 assert stream.read().decode('utf-8') == '已有汇报结果'

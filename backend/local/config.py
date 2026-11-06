@@ -41,6 +41,10 @@ def load():
         "use_vlm": True,
         "whisper_model": os.getenv("WHISPER_MODEL", "small"),
         "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
+        "llm_context_tokens": int(os.getenv("LLM_CONTEXT_TOKENS", "32768")),
+        "vlm_context_tokens": int(os.getenv("VLM_CONTEXT_TOKENS", "32768")),
+        "llm_max_output_tokens": int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8192")),
+        "vlm_max_output_tokens": int(os.getenv("VLM_MAX_OUTPUT_TOKENS", "8192")),
     }
     with LOCK:
         if SETTINGS.exists():
@@ -67,6 +71,10 @@ def save(values):
             if key not in values:
                 continue
             value = values[key]
+            if key.endswith("context_tokens") or key.endswith("max_output_tokens"):
+                low, high = (2048, 2_000_000) if key.endswith("context_tokens") else (256, 131072)
+                if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                    raise ValueError(f"{key} 必须为 {low}–{high} 范围内的整数")
             if key.endswith("api_format") and value not in ({"openai", "anthropic"} if key.startswith("llm") else {"", "openai", "anthropic"}):
                 raise ValueError("模型接口格式必须为 OpenAI 兼容或 Anthropic Messages")
             if key == "whisper_model" and value not in WHISPER_MODELS:

@@ -711,6 +711,16 @@ input[type="checkbox"] {
   margin-left: auto;
   white-space: nowrap;
 }
+.status-badge.partial { color: #a76812; background: #fdf6ec; }
+.status-dot.partial { background: #e6a23c; }
+.output-progress-list { margin-top: 18px; display: grid; gap: 12px; }
+.output-progress-item { padding-top: 12px; border-top: 1px solid #ebeef5; }
+.output-progress-item > div { display: flex; align-items: center; gap: 10px; }
+.output-progress-item strong { min-width: 0; flex: initial; }
+.output-progress-item small { margin-left: auto; color: #909399; }
+.output-progress-item p { margin: 6px 0 0; color: #909399; font-size: 12px; overflow-wrap: anywhere; }
+.model-budgets { margin-top: 20px; }
+.model-budgets summary { cursor: pointer; margin-bottom: 12px; }
 .task-controls {
   display: flex;
   gap: 20px;

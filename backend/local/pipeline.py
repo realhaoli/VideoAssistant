@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -7,6 +8,7 @@ from . import config, exports, media, subtitles, pdf_export
 from .intelligence import Intelligence
 from .report_prompts import VERSION
 from .storage import atomic_bytes, atomic_json, atomic_text
+from .jobs import Cancelled, ServiceStopping, OutputFailure
 
 
 def cached(path, generate):
@@ -15,6 +17,12 @@ def cached(path, generate):
     value = generate()
     atomic_json(path, value)
     return value
+
+
+def check_duration(duration):
+    maximum = int(os.getenv('MAX_DURATION_HOURS', '24')) * 3600
+    if maximum and float(duration or 0) > maximum:
+        raise ValueError('素材时长超过 MAX_DURATION_HOURS 限制，请调整部署配置后重试')
 
 
 def run(store, job_id):
@@ -30,6 +38,16 @@ def run(store, job_id):
     exports.normalize_outputs(folder, modes)
     intelligence = Intelligence(store.settings(job_id), check, checkpoint_dir=folder / "subtitle-batches", warning=warn)
     exports.publish(store, job_id)
+    ready = set()
+    artifacts = {entry['name']:entry for entry in store.get(job_id)['artifacts']}
+    for mode in modes:
+        if all(name in artifacts and not artifacts[name].get('pending') and (output/name).stat().st_size == artifacts[name]['size']
+               for name,_,_ in exports.ARTIFACTS[mode]):
+            ready.add(mode)
+            store.update_output(job_id, mode, status='completed', progress=100, message='已完成', error=None)
+    modes -= ready
+    if not modes:
+        return
     tracks = {}
     source = job["source"]
     metadata = {"title": job["title"]}
@@ -45,6 +63,7 @@ def run(store, job_id):
                     tracks[lang] = subtitles.parse((folder / f"platform.{lang}.srt").read_text(encoding="utf-8"))
         else:
             metadata, tracks = media.inspect_url(source["url"], folder, check, warn)
+        check_duration(metadata.get('duration'))
         title = metadata.get("title") or job["title"]
         folder = store.source_title(job_id, title)
         output = folder / "output"
@@ -59,7 +78,7 @@ def run(store, job_id):
         need_video = "illustrated" in modes or ("download" in modes and not has_reports)
         if need_video or not tracks or ("download" in modes and not has_reports):
             progress("download", 8, "下载最高画质视频" if "download" in modes and not has_reports else "下载分析所需的视频" if need_video else "没有可用字幕，下载音频用于本地转写", 0)
-            media_path = media.download(source["url"], folder, best="download" in modes and not has_reports, audio=not need_video,
+            media_path = media.download(source["url"], folder, best="download" in modes and need_video, audio=not need_video,
                                         check=check, progress=lambda p: progress("download", 8 + p * .14, f"素材下载 {p}%", p))
     else:
         media_path = folder / source["filename"]
@@ -77,6 +96,7 @@ def run(store, job_id):
             raise ValueError("图文汇报需要视频画面；纯音频请改选文字汇报、思维导图或字幕文件")
         if not tracks:
             tracks = media.embedded_subtitles(media_path, folder, check)
+    check_duration(metadata.get('duration'))
     if "illustrated" in modes:
         cover = folder / "cover.jpg"
         if not cover.exists() and media_path:
@@ -119,6 +139,7 @@ def run(store, job_id):
     if not raw:
         raise ValueError("字幕为空，无法继续处理")
     metadata["duration"] = max(float(metadata.get("duration") or 0), max(s["end"] for s in raw))
+    check_duration(metadata['duration'])
     (folder / "subtitles.original.srt").write_text(subtitles.srt(raw), encoding="utf-8")
     store.update(job_id, transcript_source=transcript_source, duration=metadata["duration"])
     progress("transcript", 45, f"已取得字幕：{transcript_source}")
@@ -139,93 +160,134 @@ def run(store, job_id):
         exports.write_text(output / "subtitles.zh.txt", text)
         exports.publish(store, job_id)
 
-    if modes & {"illustrated", "text", "mindmap"}:
-        progress("chapters", 60, "按完整内容组织中文汇报章节")
-        plan = intelligence.plan(zh, metadata["duration"], options, metadata, folder / f"plan-{VERSION}.json",
-                                 lambda p: progress("chapters", 60 + p * 3, "组织汇报章节", p * 100))
-        store.update(job_id, report_title=plan["title"])
-        (folder / "chapters.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-        if modes & {"illustrated", "text", "mindmap"}:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            parts, illustrated_parts, used = [], [], []
-            chapters = plan["chapters"]
-            progress("report", 63, f"已完成 0/{len(chapters)} 章正文与配图评选", 0)
-
-            def chapter_work(index, chapter):
-                check()
-                draft_path = folder / f"draft-{VERSION}-{index}.md"
-                def draft():
-                    if draft_path.exists():
-                        return draft_path.read_text(encoding="utf-8")
-                    body = intelligence.draft(chapter, zh, options)
-                    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
-                    atomic_text(draft_path, body)
-                    return body
-                images = []
-                with ThreadPoolExecutor(max_workers=2) as parallel:
-                    body_future = parallel.submit(draft)
-                    if "illustrated" in modes:
-                        images_future = parallel.submit(media.candidates, media_path, chapter, folder / f"frames-{VERSION}", index, [], check)
-                        images = images_future.result()
-                    body = body_future.result()
-                evidence = "\n".join(s["text"] for s in zh if s["end"] > chapter["start"] and s["start"] < chapter["end"])
-                body = exports.grounded_body(body, evidence)
-                body = re.sub(r"(?m)^#{1,2}\s+[^\n]*\n?", "", body).strip()
-                body = re.sub(r"\n+\s*[（(]注[:：]\s*(?:已删除|已核查|已修订|已去除|已移除)[\s\S]*?[）)]\s*$", "", body).strip()
-                ranked = []
-                if images:
-                    if intelligence.config.get("use_vlm", True):
-                        try:
-                            ranked = intelligence.select(chapter, images, body)
-                        except Exception as exc:
-                            check()
-                            warn(f"第 {index + 1} 章视觉评选不可用，采用清晰度选帧：{type(exc).__name__}")
-                            ranked = [dict(index=i, candidate=image, caption="原视频画面 · " + chapter["title"], reason="清晰度与去重筛选") for i, image in enumerate(images)]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .output_progress import OutputProgress
+    tracker = OutputProgress(store, job_id, modes)
+    if "subtitles" in modes:
+        tracker.done("subtitles")
+    branches = {}
+    with ThreadPoolExecutor(max_workers=2) as parallel:
+        report_modes = modes & {"illustrated", "text", "mindmap"}
+        if report_modes:
+            future = parallel.submit(_report_outputs, store, job_id, folder, output, modes, options,
+                intelligence, zh, metadata, media_path, check, warn, tracker.for_branch("report"), tracker)
+            branches[future] = report_modes
+        if "download" in modes:
+            future = parallel.submit(_video_output, store, job_id, folder, output, modes, intelligence,
+                zh, tracks, source, media_path, check, tracker.for_branch("video"))
+            branches[future] = {"download"}
+        errors = {}
+        for future in as_completed(branches):
+            try:
+                branch_errors = future.result() or {}
+                errors.update(branch_errors)
+                for mode in branches[future]:
+                    if mode in branch_errors:
+                        tracker.failed(mode, branch_errors[mode])
                     else:
-                        ranked = [dict(index=i, candidate=image, caption="原视频画面 · " + chapter["title"], reason="清晰度与去重筛选") for i, image in enumerate(images)]
-                return index, chapter, body, ranked
+                        tracker.done(mode)
+            except (Cancelled, ServiceStopping):
+                raise
+            except Exception as exc:
+                for mode in branches[future]:
+                    errors[mode] = config.redact(str(exc))[:1200]
+                    tracker.failed(mode, errors[mode])
+            exports.publish(store, job_id)
 
-            results = {}
+    progress("export", 99, "校验生成文件与资源路径")
+    provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
+                  "transcript_source": transcript_source, "language": "zh-CN", "whisper_model": store.get(job_id).get("whisper_model"),
+                  "warnings": store.get(job_id)["warnings"]}
+    (folder / "source.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
+    exports.publish(store, job_id)
+
+    if errors:
+        raise OutputFailure(errors)
+
+
+def _report_outputs(store, job_id, folder, output, modes, options, intelligence, zh, metadata, media_path, check, warn, progress, tracker):
+    progress("chapters", 60, "按完整内容组织中文汇报章节")
+    plan = intelligence.plan(zh, metadata["duration"], options, metadata, folder / f"plan-{VERSION}.json",
+                             lambda p: progress("chapters", 60 + p * 3, "组织汇报章节", p * 100))
+    store.update(job_id, report_title=plan["title"])
+    (folder / "chapters.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    if modes & {"illustrated", "text", "mindmap"}:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        parts, illustrated_parts, used = [], [], []
+        chapters = plan["chapters"]
+        progress("report", 63, f"已完成 0/{len(chapters)} 章正文与配图评选", 0)
+
+        def chapter_work(index, chapter):
+            check()
+            draft_path = folder / f"draft-{VERSION}-{index}.md"
+            def draft():
+                if draft_path.exists():
+                    return draft_path.read_text(encoding="utf-8")
+                body = intelligence.draft(chapter, zh, options)
+                body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+                atomic_text(draft_path, body)
+                return body
+            images = []
             with ThreadPoolExecutor(max_workers=2) as parallel:
-                futures = [parallel.submit(chapter_work, index, chapter) for index, chapter in enumerate(chapters)]
-                for future in as_completed(futures):
+                body_future = parallel.submit(draft)
+                if "illustrated" in modes:
+                    images_future = parallel.submit(media.candidates, media_path, chapter, folder / f"frames-{VERSION}", index, [], check)
+                    images = images_future.result()
+                body = body_future.result()
+            evidence = "\n".join(s["text"] for s in zh if s["end"] > chapter["start"] and s["start"] < chapter["end"])
+            body = exports.grounded_body(body, evidence)
+            body = re.sub(r"(?m)^#{1,2}\s+[^\n]*\n?", "", body).strip()
+            body = re.sub(r"\n+\s*[（(]注[:：]\s*(?:已删除|已核查|已修订|已去除|已移除)[\s\S]*?[）)]\s*$", "", body).strip()
+            ranked = []
+            if images:
+                if intelligence.config.get("use_vlm", True):
                     try:
-                        index, chapter, body, ranked = future.result()
-                    except Exception:
-                        for pending in futures:
-                            pending.cancel()
-                        raise
-                    results[index] = (chapter, body, ranked)
-                    progress("report", 63 + len(results) / len(chapters) * 28,
-                             f"已完成 {len(results)}/{len(chapters)} 章正文与配图评选", len(results) / len(chapters) * 100)
-            selections = []
-            for index in range(len(chapters)):
-                chapter, body, ranked = results[index]
-                choice = next((entry for entry in ranked if not any((entry["candidate"]["hash"] ^ other).bit_count() < 12 for other in used)), None)
-                heading = f"## {chapter['title']}\n\n*{subtitles.stamp(chapter['start']).split(',')[0]} — {subtitles.stamp(chapter['end']).split(',')[0]}*\n\n"
-                parts.append(heading + body)
-                figure = ""
-                if choice:
-                    selected = choice["candidate"]
-                    used.append(selected["hash"])
-                    relative = f"image/chapter-{index + 1:02d}.jpg"
-                    (output / "image").mkdir(exist_ok=True)
-                    atomic_bytes(output / relative, Path(selected["path"]).read_bytes())
-                    caption = re.sub(r"[\[\]<>\n]", "", str(choice.get("caption") or chapter["title"]))
-                    figure = f"\n\n![{caption}]({relative})\n\n*{caption} · 视频 {subtitles.stamp(selected['time']).split(',')[0]}*\n\n"
-                    selections.append(dict(chapter=chapter["title"], image=relative, time=selected["time"], caption=caption, reason=choice.get("reason", ""), score=choice.get("score")))
-                elif "illustrated" in modes:
-                    warn(f"第 {index + 1} 章没有清晰、相关且不重复的画面，未强行插图")
-                # Put the illustration after the opening explanation, inside its chapter.
-                opening, separator, remainder = body.partition("\n\n")
-                illustrated_parts.append(heading + opening + figure + (separator + remainder if separator else ""))
-            (folder / "image-selections.json").write_text(json.dumps(selections, ensure_ascii=False, indent=2), encoding="utf-8")
-            if "mindmap" in modes:
-                outline = exports.report_outline(plan, [results[i][1] for i in range(len(chapters))])
-                exports.mindmap_data(folder / "mindmap.json", outline)
-                progress("mindmap", 91, "生成思维导图 PDF")
-                pdf_export.render(folder, check)
-                exports.publish(store, job_id)
+                        ranked = intelligence.select(chapter, images, body)
+                    except Exception as exc:
+                        check()
+                        warn(f"第 {index + 1} 章视觉评选不可用，采用清晰度选帧：{type(exc).__name__}")
+                        ranked = [dict(index=i, candidate=image, caption="原视频画面 · " + chapter["title"], reason="清晰度与去重筛选") for i, image in enumerate(images)]
+                else:
+                    ranked = [dict(index=i, candidate=image, caption="原视频画面 · " + chapter["title"], reason="清晰度与去重筛选") for i, image in enumerate(images)]
+            return index, chapter, body, ranked
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=2) as parallel:
+            futures = [parallel.submit(chapter_work, index, chapter) for index, chapter in enumerate(chapters)]
+            for future in as_completed(futures):
+                try:
+                    index, chapter, body, ranked = future.result()
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                results[index] = (chapter, body, ranked)
+                progress("report", 63 + len(results) / len(chapters) * 28,
+                         f"已完成 {len(results)}/{len(chapters)} 章正文与配图评选", len(results) / len(chapters) * 100)
+        selections = []
+        for index in range(len(chapters)):
+            chapter, body, ranked = results[index]
+            choice = next((entry for entry in ranked if not any((entry["candidate"]["hash"] ^ other).bit_count() < 12 for other in used)), None)
+            heading = f"## {chapter['title']}\n\n*{subtitles.stamp(chapter['start']).split(',')[0]} — {subtitles.stamp(chapter['end']).split(',')[0]}*\n\n"
+            parts.append(heading + body)
+            figure = ""
+            if choice:
+                selected = choice["candidate"]
+                used.append(selected["hash"])
+                relative = f"image/chapter-{index + 1:02d}.jpg"
+                (output / "image").mkdir(exist_ok=True)
+                atomic_bytes(output / relative, Path(selected["path"]).read_bytes())
+                caption = re.sub(r"[\[\]<>\n]", "", str(choice.get("caption") or chapter["title"]))
+                figure = f"\n\n![{caption}]({relative})\n\n*{caption} · 视频 {subtitles.stamp(selected['time']).split(',')[0]}*\n\n"
+                selections.append(dict(chapter=chapter["title"], image=relative, time=selected["time"], caption=caption, reason=choice.get("reason", ""), score=choice.get("score")))
+            elif "illustrated" in modes:
+                warn(f"第 {index + 1} 章没有清晰、相关且不重复的画面，未强行插图")
+            # Put the illustration after the opening explanation, inside its chapter.
+            opening, separator, remainder = body.partition("\n\n")
+            illustrated_parts.append(heading + opening + figure + (separator + remainder if separator else ""))
+        (folder / "image-selections.json").write_text(json.dumps(selections, ensure_ascii=False, indent=2), encoding="utf-8")
+        errors = {}
+        try:
             progress("overview", 92, "提炼技术结论与关键数据")
             overview = cached(folder / f"overview-{VERSION}.json", lambda: intelligence.overview([(results[i][0], results[i][1]) for i in range(len(chapters))])) if modes & {"text", "illustrated"} else dict(one_sentence="", key_conclusions=[], data_terms=[])
             title = re.sub(r"[<>\n]", "", str(plan["title"]))
@@ -236,39 +298,72 @@ def run(store, job_id):
             terms = "\n\n## 关键数据与术语\n\n" + "\n".join("- " + v for v in overview["data_terms"]) if overview["data_terms"] else ""
             if "text" in modes:
                 exports.report(output, "text", lead + "\n\n".join(parts) + terms)
+                exports.publish(store, job_id)
+                tracker.done("text")
             if "illustrated" in modes:
-                front = "![视频封面](image/cover.jpg)\n\n" if (output / "image/cover.jpg").exists() else ""
-                exports.report(output, "illustrated", lead + front + "\n\n".join(illustrated_parts) + terms)
-                exports.bundle(output)
-            exports.publish(store, job_id)
-    if "download" in modes:
-        progress("bilingual", 93, "准备中英双字幕轨")
-        if source["type"] == "url" and modes & {"illustrated", "text", "mindmap"}:
-            progress("download", 93, "汇报已可下载，继续下载最高画质视频", 0)
-            original = folder / "original"
-            original.mkdir(exist_ok=True)
-            media_path = media.download(source["url"], original, best=True, audio=False, check=check,
-                                        progress=lambda p: progress("download", 93 + p * .01, f"汇报已可下载，最高画质视频下载 {p}%", p))
-        en = tracks.get("en")
-        if en is None:
-            progress("translate_en", 94, "翻译英文字幕", 0)
-            en = cached(folder / "translated.en.json", lambda: intelligence.transform(zh, language="en",
-                        progress=lambda p: progress("translate_en", 94 + p, f"翻译英文字幕 {round(p * 100)}%", p * 100)))
-            progress("translate_en", 95, "翻译英文字幕", 100)
-        (folder / "subtitles.en.srt").write_text(subtitles.srt(en), encoding="utf-8")
-        final_video = output / "video.mp4"
-        if not final_video.exists():
-            progress("embed", 95, "封装 MP4 视频与可切换中英字幕轨", 0)
-            temporary = folder / "video.partial.mp4"
-            media.embed(media_path, folder / "subtitles.zh.srt", folder / "subtitles.en.srt", temporary, check,
-                        progress=lambda p: progress("embed", 95 + p * .03, f"视频封装 {p}%", p))
-            temporary.replace(final_video)
-            progress("embed", 98, "视频封装完成", 100)
-        exports.publish(store, job_id)
+                try:
+                    front = "![视频封面](image/cover.jpg)\n\n" if (output / "image/cover.jpg").exists() else ""
+                    exports.report(output, "illustrated", lead + front + "\n\n".join(illustrated_parts) + terms)
+                    exports.bundle(output)
+                    exports.publish(store, job_id)
+                    tracker.done("illustrated")
+                except (Cancelled, ServiceStopping):
+                    raise
+                except Exception as exc:
+                    errors['illustrated'] = config.redact(str(exc))[:1200]
+        except (Cancelled, ServiceStopping):
+            raise
+        except Exception as exc:
+            for mode in modes & {'text','illustrated'}:
+                errors[mode] = config.redact(str(exc))[:1200]
+        if "mindmap" in modes:
+            try:
+                outline = exports.report_outline(plan, [results[i][1] for i in range(len(chapters))])
+                exports.mindmap_data(folder / "mindmap.json", outline)
+                progress("mindmap", 91, "生成思维导图 PDF")
+                pdf_export.render(folder, check)
+                exports.publish(store, job_id)
+                tracker.done("mindmap")
+            except (Cancelled, ServiceStopping):
+                raise
+            except Exception as exc:
+                errors['mindmap'] = config.redact(str(exc))[:1200]
+        return errors
 
-    progress("export", 99, "校验生成文件与资源路径")
-    provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
-                  "transcript_source": transcript_source, "language": "zh-CN", "whisper_model": store.get(job_id).get("whisper_model"),
-                  "warnings": store.get(job_id)["warnings"]}
-    (folder / "source.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _video_output(store, job_id, folder, output, modes, intelligence, zh, tracks, source, media_path, check, progress):
+    progress("bilingual", 93, "准备中英双字幕轨")
+    if source["type"] == "url" and (media_path is None or not _best_video_ready(media_path, folder)):
+        progress("download", 93, "下载最高画质视频", 0)
+        original = folder / "original"
+        original.mkdir(exist_ok=True)
+        media_path = media.download(source["url"], original, best=True, audio=False, check=check,
+                                    progress=lambda p: progress("download", 93 + p * .01, f"最高画质视频下载 {p}%", p))
+    en = tracks.get("en")
+    if en is None:
+        progress("translate_en", 94, "翻译英文字幕", 0)
+        en = cached(folder / "translated.en.json", lambda: intelligence.transform(zh, language="en",
+                    progress=lambda p: progress("translate_en", 94 + p, f"翻译英文字幕 {round(p * 100)}%", p * 100)))
+        progress("translate_en", 95, "翻译英文字幕", 100)
+    (folder / "subtitles.en.srt").write_text(subtitles.srt(en), encoding="utf-8")
+    final_video = output / "video.mp4"
+    if not final_video.exists():
+        progress("embed", 95, "封装 MP4 视频与可切换中英字幕轨", 0)
+        temporary = folder / "video.partial.mp4"
+        media.embed(media_path, folder / "subtitles.zh.srt", folder / "subtitles.en.srt", temporary, check,
+                    progress=lambda p: progress("embed", 95 + p * .03, f"视频封装 {p}%", p))
+        temporary.replace(final_video)
+        progress("embed", 98, "视频封装完成", 100)
     exports.publish(store, job_id)
+
+
+def _best_video_ready(path, folder):
+    marker = Path(path).parent / "download-complete.json"
+    if not marker.is_file():
+        return False
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        return value.get("best") and not value.get("audio") and value.get("filename") == Path(path).name and value.get('size', Path(path).stat().st_size) == Path(path).stat().st_size
+    except (OSError, ValueError, AttributeError):
+        return False

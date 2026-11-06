@@ -210,25 +210,28 @@ ARTIFACTS = {
 
 
 def publish(store, job_id):
-    job = store.get(job_id)
-    folder = store.directory(job_id)
-    output = folder / "output"
-    artifacts = []
-    for mode, entries in ARTIFACTS.items():
-        if mode not in job["modes"]:
-            continue
-        for name, label, kind in entries:
-            path = output / name
-            pending = name == "mindmap.pdf" and (folder / "mindmap.json").is_file() and not path.exists()
-            if not path.is_file() and not pending:
+    with store.lock:
+        job = store.get(job_id)
+        folder = store.directory(job_id)
+        output = folder / "output"
+        artifacts = []
+        for mode, entries in ARTIFACTS.items():
+            if mode not in job["modes"]:
                 continue
-            entry = dict(name=name, label=label, kind=kind, size=path.stat().st_size if path.exists() else 0)
-            if pending:
-                entry["pending"] = True
-            if mode == "illustrated":
-                entry["download_name"] = "illustrated.zip"
-            artifacts.append(entry)
-    store.update(job_id, artifacts=artifacts)
+            if mode == 'illustrated' and not (output/'illustrated.zip').is_file():
+                continue
+            for name, label, kind in entries:
+                path = output / name
+                pending = name == "mindmap.pdf" and (folder / "mindmap.json").is_file() and not path.exists()
+                if not path.is_file() and not pending:
+                    continue
+                entry = dict(name=name, label=label, kind=kind, size=path.stat().st_size if path.exists() else 0)
+                if pending:
+                    entry["pending"] = True
+                if mode == "illustrated":
+                    entry["download_name"] = "illustrated.zip"
+                artifacts.append(entry)
+        store.update(job_id, artifacts=artifacts)
 
 
 def mindmap_data(path, plan):
@@ -257,6 +260,7 @@ def normalize_outputs(folder, modes):
         shutil.copy2(output / "transcript.zh.txt", output / "subtitles.zh.txt")
     if "illustrated" in modes and (output / "illustrated.md").is_file():
         content = (output / "illustrated.md").read_text(encoding="utf-8")
+        original_content = content
         def migrate_image(match):
             relative = match[2]
             source = (output / relative).resolve()
@@ -268,8 +272,9 @@ def normalize_outputs(folder, modes):
                 shutil.copy2(source, target)
             return f"![{match[1]}](image/{target.name})"
         content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", migrate_image, content)
-        report(output, "illustrated", content)
-        bundle(output)
+        if content != original_content or not (output/'illustrated.html').is_file() or not (output/'illustrated.zip').is_file():
+            report(output, "illustrated", content)
+            bundle(output)
     allowed = {name for mode in modes for name, _, _ in ARTIFACTS.get(mode, [])}
     if "illustrated" in modes:
         allowed |= {"image", "illustrated.zip"}

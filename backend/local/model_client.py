@@ -1,6 +1,8 @@
 """OpenAI Chat Completions and Anthropic Messages transport adapters."""
 import base64
-import mimetypes
+import io
+import os
+import re
 
 import requests
 from openai import OpenAI, APIStatusError
@@ -9,14 +11,42 @@ from urllib3.util.retry import Retry
 
 
 class ModelLimitError(ValueError):
-    def __init__(self, kind="output"):
+    def __init__(self, kind="output", maximum=None):
         self.kind = kind
+        self.maximum = maximum
         super().__init__("模型输入或输出超过长度限制，已保留完成的分段，可继续处理")
 
 
 def context_error(value):
     text = str(value).lower()
     return any(term in text for term in ("context_length", "context window", "maximum context", "too many tokens", "prompt is too long", "input is too long", "context length", "上下文长度", "输入长度", "token limit", "max_tokens", "max_output_tokens"))
+
+
+def limit_error(value, status):
+    text = str(value).lower()
+    if status not in {400, 413, 422}:
+        return None
+    context = any(term in text for term in ("context", "input token", "prompt is too long", "输入长度", "上下文", "too many tokens"))
+    if not context and any(term in text for term in ("max_tokens", "max_output_tokens", "maximum output", "最大输出")):
+        match = re.search(r'(?:max_tokens|max_output_tokens).*?(?:\[\s*\d+\s*,\s*|equal to\s*|at most\s*|<=\s*|上限[：:\s]*)(\d+)', text)
+        return ModelLimitError("output_parameter", int(match[1]) if match else None)
+    if context_error(text):
+        return ModelLimitError("context")
+    return ModelLimitError("payload") if status == 413 else None
+
+
+def image_payload(path):
+    from PIL import Image, ImageOps
+    with Image.open(path) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+        image.thumbnail((1600, 1600))
+        for quality in (85, 70, 55):
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality)
+            content = buffer.getvalue()
+            if len(content) <= 2 * 1024**2:
+                return "image/jpeg", base64.b64encode(content).decode("ascii")
+        raise ModelLimitError("payload")
 
 
 def connection(config, visual=False):
@@ -43,8 +73,13 @@ def complete(config, prompt, system, visual, max_tokens, check):
         raise ValueError("请在模型设置中配置接口地址、模型名和 API Key")
     check()
     images = []
+    if len(visual or []) > 4:
+        raise ModelLimitError("payload")
     for path in visual or []:
-        images.append((mimetypes.guess_type(path.name)[0] or "image/jpeg", base64.b64encode(path.read_bytes()).decode()))
+        images.append(image_payload(path))
+    maximum_bytes = int(os.getenv("MODEL_REQUEST_MB", "16")) * 1024**2
+    if len((prompt + system).encode('utf-8')) + sum(len(data) for _, data in images) + 4096 > maximum_bytes:
+        raise ModelLimitError("payload")
     if selected["format"] == "anthropic":
         content = [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}} for mime, data in images]
         content.append({"type": "text", "text": prompt})
@@ -55,8 +90,9 @@ def complete(config, prompt, system, visual, max_tokens, check):
             response = session.post(base_url(selected["url"], "anthropic") + "/messages", json=payload,
                                     headers={"x-api-key": selected["key"], "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, timeout=(15, 150))
             if not response.ok:
-                if response.status_code in {400, 413, 422} and context_error(response.text):
-                    raise ModelLimitError("context")
+                error = limit_error(response.text, response.status_code)
+                if error:
+                    raise error
                 raise ValueError(f"Anthropic 接口请求失败（HTTP {response.status_code}），请检查接口地址、模型名、密钥与额度")
             body = response.json()
         if body.get("stop_reason") in {"max_tokens", "model_context_window_exceeded"}:
@@ -73,8 +109,9 @@ def complete(config, prompt, system, visual, max_tokens, check):
                 response = client.chat.completions.create(model=selected["model"], messages=[{"role": "system", "content": system},
                                                             {"role": "user", "content": content if images else prompt}], max_tokens=max_tokens, **sampling)
             except APIStatusError as exc:
-                if exc.status_code == 413 or (exc.status_code in {400, 422} and context_error(exc)):
-                    raise ModelLimitError("context") from exc
+                error = limit_error(str(exc), exc.status_code)
+                if error:
+                    raise error from exc
                 raise
         if response.choices[0].finish_reason == "length":
             raise ModelLimitError("output")

@@ -28,6 +28,12 @@ class ServiceStopping(Exception):
     pass
 
 
+class OutputFailure(Exception):
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__('；'.join(f'{mode}: {message}' for mode,message in errors.items()))
+
+
 class ResourceLease:
     def __init__(self, store, job_id, stream):
         self.store, self.job_id, self.stream = store, job_id, stream
@@ -189,6 +195,12 @@ class JobStore:
             return {"task_count": len(self.jobs), "recovered_tasks": self.history_recovered,
                     "unreadable_tasks": self.history_unreadable}
 
+    def update_output(self, job_id, mode, **fields):
+        with self.lock:
+            job = self.jobs[job_id]
+            job.setdefault('output_states',{}).setdefault(mode,{}).update(fields)
+            self._persist(job)
+
     def stop(self, timeout=15):
         self.stopping.set()
         for _ in self.workers:
@@ -223,6 +235,7 @@ class JobStore:
             job = dict(id=job_id, title=title, modes=list(dict.fromkeys(modes)), source=copy.deepcopy(source),
                        options=copy.deepcopy(options), status="queued" if enqueue else "uploading", progress=0, stage="queued", stage_progress=None, message="等待处理",
                        created_at=time.time(), updated_at=time.time(), artifacts=[], events=[], warnings=[], storage_folder=folder.name)
+            job['output_states'] = {mode:{'status':'pending','progress':0,'message':'等待处理'} for mode in job['modes']}
             self.jobs[job_id], self.paths[job_id], self.readers[job_id] = job, folder, 0
             # This private snapshot never appears in task API responses.
             atomic_json(folder / "model-settings.json", load(), private=True)
@@ -327,6 +340,9 @@ class JobStore:
             if self.get(job_id)["status"] in ACTIVE:
                 raise ValueError("任务仍在处理中")
             self.cancelled.discard(job_id)
+            for value in self.jobs[job_id].get('output_states',{}).values():
+                if value.get('status') != 'completed':
+                    value.update(status='pending', progress=0, message='等待继续处理', error=None)
             self.update(job_id, status="queued", stage="queued", progress=0, message="等待继续处理", error=None)
             self.queue.put(job_id)
             return self.get(job_id)
@@ -378,16 +394,29 @@ class JobStore:
                 run(self, job_id)
                 self.check(job_id)
                 self.update(job_id, status="completed", progress=100, stage="completed", stage_progress=100, message="处理完成，可以下载")
+            except OutputFailure as exc:
+                completed = any(value.get('status') == 'completed' for value in self.get(job_id).get('output_states',{}).values())
+                self.update(job_id, status='partial' if completed else 'failed', progress=100,
+                            message='部分产物失败，已完成文件可下载，可继续处理失败项' if completed else '处理失败，可继续处理',
+                            error=redact(str(exc))[:1800])
             except ServiceStopping:
                 if job_id in self.jobs:
                     self.update(job_id, status="queued", message="服务暂停，等待恢复处理")
                 return
             except Cancelled:
+                self._finish_open_outputs(job_id, 'cancelled')
                 self.update(job_id, status="cancelled", message="任务已取消")
             except Exception as exc:
+                self._finish_open_outputs(job_id, 'failed')
                 self.update(job_id, status="failed", message="处理失败，可检查原因后重试", error=redact(f"{type(exc).__name__}: {exc}")[:1800])
             finally:
                 self.queue.task_done()
+
+    def _finish_open_outputs(self, job_id, status):
+        with self.lock:
+            for value in self.jobs[job_id].get('output_states',{}).values():
+                if value.get('status') not in {'completed','failed'}:
+                    value.update(status=status, message='已取消' if status == 'cancelled' else '处理失败')
 
 
 store = JobStore()

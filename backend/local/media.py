@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -9,13 +10,12 @@ from pathlib import Path
 
 from .config import DATA, WHISPER_MODELS, WHISPER_DEVICES
 from . import subtitles
+from .resources import ASR, DOWNLOADS, FFMPEG, FRAMES, ensure_disk, setting
 
-ASR_LOCK = threading.Lock()
 MODEL_LOCK = threading.Lock()
 MODEL = None
 MODEL_KEY = None
 WHISPER_RUNTIME = {}
-FRAME_SLOTS = threading.BoundedSemaphore(3)
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4v"}
 
 
@@ -59,7 +59,15 @@ def command(args, check=lambda: None, timeout=7200, *, on_poll=None):
                     proc.wait()
 
 
-def ffmpeg_command(args, check, *, duration=None, progress=None, timeout=7200):
+def ffmpeg_command(args, check, *, duration=None, progress=None, timeout=None):
+    with FFMPEG.slot(check):
+        threads = str(setting('FFMPEG_THREADS', 2, high=16))
+        args = [args[0], '-threads', threads, '-filter_threads', '1', *args[1:-1], '-threads', threads, args[-1]]
+        return _ffmpeg_command(args, check, duration=duration, progress=progress,
+                               timeout=timeout if timeout is not None else setting('FFMPEG_TIMEOUT_SECONDS',21600,low=60,high=172800))
+
+
+def _ffmpeg_command(args, check, *, duration=None, progress=None, timeout=7200):
     """Read FFmpeg's processed media time; never infer work from elapsed time."""
     if progress is None or not duration or duration <= 0:
         return command(args, check, timeout=timeout)
@@ -125,6 +133,8 @@ def inspect_url(url, folder, check, warning):
     tracks = {}
     with YoutubeDL(network_options()) as ydl:
         info = ydl.extract_info(url, download=False)
+        if info.get('is_live'):
+            raise ValueError('暂不处理正在直播的素材，请提交已结束的视频')
         if info.get("_type") in {"playlist", "multi_video"}:
             raise ValueError("请提交单个视频链接，暂不支持播放列表")
         check()
@@ -148,28 +158,66 @@ def inspect_url(url, folder, check, warning):
 
 
 def download(url, folder, *, best, audio, check, progress):
+    with DOWNLOADS.slot(check):
+        return _download(url, folder, best=best, audio=audio, check=check, progress=progress)
+
+
+def _download(url, folder, *, best, audio, check, progress):
     from yt_dlp import YoutubeDL
-    existing = [p for p in folder.glob("source.*") if p.suffix.lower() in MEDIA_EXTS and p.stat().st_size > 0]
-    if existing:
-        progress(100)
-        return existing[0]
+    from .storage import atomic_json
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    maximum = setting('MAX_DOWNLOAD_MB', 16384, high=1_048_576) * 1024**2
+    def completed_files():
+        # source.f137.mp4 and source.f140.m4a are yt-dlp components, not results.
+        return [p for p in folder.glob('source.*') if p.stem == 'source' and p.suffix.lower() in MEDIA_EXTS and p.stat().st_size > 0]
+    def valid(path):
+        if path.stat().st_size > maximum:
+            raise ValueError('下载文件超过 MAX_DOWNLOAD_MB 限制，现有文件已保留')
+        try:
+            details = probe(path)
+            return any(s.get('codec_type') == ('audio' if audio else 'video') for s in details.get('streams', []))
+        except (RuntimeError, ValueError):
+            return False
+    for candidate in completed_files():
+        if valid(candidate):
+            progress(100)
+            return candidate
+        candidate.rename(candidate.with_name(f'source.invalid-{time.time_ns()}{candidate.suffix}'))
+    ensure_disk(folder)
     opts = download_options(folder, best=best, audio=audio)
+    last_disk_check = 0
 
     def hook(event):
+        nonlocal last_disk_check
         check()
         if event["status"] == "downloading":
             total = event.get("total_bytes") or event.get("total_bytes_estimate")
+            downloaded = event.get('downloaded_bytes', 0)
+            if downloaded > maximum or (total and total > maximum):
+                raise ValueError('下载超过 MAX_DOWNLOAD_MB 限制，已保留可续传文件')
+            if time.monotonic() - last_disk_check > 5:
+                ensure_disk(folder, max(0, (total or downloaded) - downloaded))
+                last_disk_check = time.monotonic()
             if total:
                 progress(min(99, int(event.get("downloaded_bytes", 0) * 100 / total)))
     opts["progress_hooks"] = [hook]
+    def postprocess(event):
+        check()
+        if event.get('status') == 'started':
+            ensure_disk(folder, sum(p.stat().st_size for p in folder.glob('source.f*') if p.is_file()))
+    opts['postprocessor_hooks'] = [postprocess]
+    opts['postprocessor_args'] = {'ffmpeg':['-threads',str(setting('FFMPEG_THREADS',2,high=16))]}
     with YoutubeDL(opts) as ydl:
         ydl.download([url])
     check()
-    files = [p for p in folder.glob("source.*") if p.suffix.lower() in MEDIA_EXTS and p.stat().st_size > 0]
+    files = [p for p in completed_files() if valid(p)]
     if not files:
         raise RuntimeError("视频下载完成但未找到媒体文件")
+    result = max(files, key=lambda p: p.stat().st_size)
+    atomic_json(folder/'download-complete.json', {'filename':result.name,'size':result.stat().st_size,'best':best,'audio':audio})
     progress(100)
-    return max(files, key=lambda p: p.stat().st_size)
+    return result
 
 
 def cover(url, output):
@@ -228,7 +276,14 @@ def whisper_status(model_name="small"):
 def _load_whisper(model_name, device):
     global MODEL, MODEL_KEY, WHISPER_RUNTIME
     from faster_whisper import WhisperModel
-    compute_type = "float16" if device == "cuda" else "int8"
+    compute_type = "int8"
+    if device == 'cuda':
+        import ctranslate2
+        requested = os.getenv('WHISPER_COMPUTE_TYPE', 'auto')
+        supported = ctranslate2.get_supported_compute_types('cuda')
+        compute_type = ('int8_float16' if 'int8_float16' in supported else 'float16') if requested == 'auto' else requested
+        if compute_type not in supported:
+            raise ValueError('GPU 不支持配置的 Whisper 计算精度，将切换 CPU')
     key = (model_name, device, compute_type)
     with MODEL_LOCK:
         if MODEL is None or MODEL_KEY != key:
@@ -239,7 +294,7 @@ def _load_whisper(model_name, device):
             local = DATA / "models" / f"faster-whisper-{model_name}"
             model_path = str(local) if (local / "model.bin").exists() else model_name
             instance = WhisperModel(model_path, device=device, compute_type=compute_type,
-                                    download_root=str(DATA / "models"))
+                                    download_root=str(DATA / "models"), cpu_threads=setting('WHISPER_CPU_THREADS', 4, high=32), num_workers=1)
             MODEL, MODEL_KEY = instance, key
         WHISPER_RUNTIME = {"model": model_name, "device": device, "compute_type": compute_type}
         return MODEL
@@ -249,15 +304,89 @@ def transcribe(path, folder, check, progress, *, settings=None, warning=lambda m
     # Keep the model and its lazy inference iterator owned by one job.
     if phase:
         phase("waiting", None)
-    while not ASR_LOCK.acquire(timeout=.25):
-        check()
-    try:
+    chunk_seconds = setting('WHISPER_CHUNK_SECONDS', 300, low=30, high=900)
+    if duration and duration > chunk_seconds:
+        return _transcribe_chunks(path, folder, check, progress, settings or {}, warning, phase, duration, chunk_seconds)
+    with ASR.slot(check):
         return _transcribe(path, folder, check, progress, settings=settings, warning=warning, phase=phase, duration=duration)
-    finally:
-        ASR_LOCK.release()
 
 
-def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None, phase=None, duration=None):
+def _transcribe_chunks(path, folder, check, progress, settings, warning, phase, duration, chunk_seconds):
+    from .storage import atomic_json
+    path, folder = Path(path), Path(folder)
+    identity = hashlib.sha256()
+    with path.open('rb') as stream:
+        identity.update(stream.read(1024**2))
+        stream.seek(max(0, path.stat().st_size - 1024**2))
+        identity.update(stream.read(1024**2))
+    identity.update(json.dumps([path.stat().st_size, duration, settings.get('whisper_model', 'small'), chunk_seconds, 'overlap-v1']).encode())
+    root = folder / 'whisper-chunks' / identity.hexdigest()
+    root.mkdir(parents=True, exist_ok=True)
+    result, languages, runtime = [], {}, {}
+    actual_settings = dict(settings)
+    progress(0)
+    for index, start in enumerate(range(0, int(duration + .999), chunk_seconds)):
+        check()
+        end = min(duration, start + chunk_seconds)
+        if end <= start:
+            continue
+        record = root / f'{index:05}.json'
+        saved = None
+        if record.is_file():
+            try:
+                saved = json.loads(record.read_text(encoding='utf-8'))
+                if saved['start'] != start or saved['end'] != end or not isinstance(saved['segments'],list) or not isinstance(saved['language'],str):
+                    raise ValueError('invalid chunk checkpoint')
+            except (OSError, ValueError, KeyError, TypeError):
+                saved = None
+                warning(f'第 {index + 1} 个转写检查点无效，将只重做该分块')
+        if saved is None:
+            work = root / f'{index:05}'
+            work.mkdir(exist_ok=True)
+            window_start, window_end = max(0, start - 2), min(duration, end + 2)
+            audio = work / 'audio.wav'
+            if not audio.is_file():
+                ensure_disk(work, int((window_end - window_start) * 32000))
+                temporary = work / 'audio.partial.wav'
+                try:
+                    if phase:
+                        phase('audio', None)
+                    ffmpeg_command(['ffmpeg', '-y', '-v', 'error', '-ss', str(window_start), '-i', str(path),
+                                    '-t', str(window_end-window_start), '-vn', '-ac', '1', '-ar', '16000', str(temporary)], check)
+                    temporary.replace(audio)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            if phase:
+                phase('waiting', None)
+            with ASR.slot(check):
+                values, language = _transcribe(path, work, check,
+                    lambda p: progress(min(99, int((start + (end-start)*p/100) / duration * 100))),
+                    settings=actual_settings, warning=warning, phase=phase, duration=window_end-window_start, allow_empty=True)
+            runtime = json.loads((work/'whisper-runtime.json').read_text(encoding='utf-8'))
+            aligned = []
+            for cue in values:
+                middle = window_start + (cue['start'] + cue['end']) / 2
+                if start <= middle < end or (end == duration and middle == end):
+                    cue = dict(cue, start=max(start, window_start+cue['start']), end=min(end, window_start+cue['end']))
+                    if cue['end'] > cue['start']:
+                        aligned.append(cue)
+            saved = {'segments':aligned, 'language':language, 'start':start, 'end':end, 'runtime':runtime}
+            atomic_json(record, saved)
+            if runtime.get('device') == 'cpu' and actual_settings.get('whisper_device') != 'cpu' and cuda_available():
+                actual_settings['whisper_device'] = 'cpu'
+            audio.unlink(missing_ok=True)
+        result.extend(saved['segments'])
+        languages[saved['language']] = languages.get(saved['language'], 0) + end-start
+        runtime = saved.get('runtime', runtime)
+        progress(min(99, int(end / duration * 100)))
+    if not result:
+        raise ValueError('未识别到有效语音，已保留分块检查点')
+    atomic_json(folder/'whisper-runtime.json', runtime)
+    progress(100)
+    return subtitles.normalize(result), max(languages, key=languages.get)
+
+
+def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None, phase=None, duration=None, allow_empty=False):
     settings = settings or {}
     model_name = settings.get("whisper_model", "small")
     requested = settings.get("whisper_device", "auto")
@@ -311,7 +440,7 @@ def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda 
         warning("GPU 转写失败，Whisper 已自动切换为 CPU 重新转写")
         result, info = recognize("cpu")
         device = "cpu"
-    if not result:
+    if not result and not allow_empty:
         raise ValueError("未识别到有效语音，请检查音轨；静音视频无法自动生成字幕")
     from .storage import atomic_json
     atomic_json(folder / "whisper-runtime.json", {"model": model_name, "device": device})
@@ -336,9 +465,9 @@ def word_cues(words):
 
 
 def frame(path, timestamp, target, check):
-    with FRAME_SLOTS:
+    with FRAMES.slot(check):
         check()
-        command(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(path),
+        ffmpeg_command(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(path),
                  "-frames:v", "1", "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "2", str(target)], check, timeout=60)
     if not target.exists() or target.stat().st_size < 100:
         raise ValueError("该位置无法抽取视频画面")
@@ -393,6 +522,7 @@ def candidates(path, chapter, output, index, used, check):
 
 
 def embed(path, zh, en, target, check, *, progress=None):
+    ensure_disk(Path(target).parent, int(Path(path).stat().st_size * 1.1))
     details = probe(path)
     streams = details.get("streams", [])
     duration = float(details.get("format", {}).get("duration") or 0)
