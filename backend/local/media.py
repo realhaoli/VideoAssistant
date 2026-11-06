@@ -28,7 +28,7 @@ def network_options():
     return options
 
 
-def command(args, check=lambda: None, timeout=7200):
+def command(args, check=lambda: None, timeout=7200, *, on_poll=None):
     """Bound subprocess runtime, drain stderr to disk and support cancellation."""
     import tempfile
     with tempfile.TemporaryFile() as err, tempfile.TemporaryFile() as out:
@@ -37,12 +37,16 @@ def command(args, check=lambda: None, timeout=7200):
         try:
             while proc.poll() is None:
                 check()
+                if on_poll:
+                    on_poll()
                 if time.monotonic() - start > timeout:
                     raise TimeoutError("媒体处理超过时间限制")
                 time.sleep(.2)
             if proc.returncode:
                 err.seek(0)
                 raise RuntimeError(err.read().decode(errors="replace")[-1800:])
+            if on_poll:
+                on_poll()
             out.seek(0)
             return out.read().decode(errors="replace")
         finally:
@@ -53,6 +57,40 @@ def command(args, check=lambda: None, timeout=7200):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+
+
+def ffmpeg_command(args, check, *, duration=None, progress=None, timeout=7200):
+    """Read FFmpeg's processed media time; never infer work from elapsed time."""
+    if progress is None or not duration or duration <= 0:
+        return command(args, check, timeout=timeout)
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="videoassistant-progress-") as temporary:
+        telemetry = Path(temporary) / "progress.txt"
+        last = 0
+        offset, pending = 0, ""
+        progress(0)
+        def poll():
+            nonlocal last, offset, pending
+            try:
+                with telemetry.open("rb") as stream:
+                    stream.seek(offset)
+                    chunk = stream.read()
+                    offset = stream.tell()
+            except FileNotFoundError:
+                return
+            lines = (pending + chunk.decode("ascii", errors="replace")).split("\n")
+            pending = lines.pop()
+            values = [line.split("=", 1)[1].strip() for line in lines if line.startswith("out_time_us=")]
+            values = [value for value in values if value.isdigit()]
+            if values:
+                percent = max(last, min(99, int(int(values[-1]) / (duration * 1_000_000) * 100)))
+                if percent > last:
+                    last = percent
+                    progress(percent)
+        result = command([args[0], "-nostats", "-progress", str(telemetry), *args[1:]], check,
+                         timeout=timeout, on_poll=poll)
+        progress(100)
+        return result
 
 
 def probe(path):
@@ -113,6 +151,7 @@ def download(url, folder, *, best, audio, check, progress):
     from yt_dlp import YoutubeDL
     existing = [p for p in folder.glob("source.*") if p.suffix.lower() in MEDIA_EXTS and p.stat().st_size > 0]
     if existing:
+        progress(100)
         return existing[0]
     opts = download_options(folder, best=best, audio=audio)
 
@@ -129,6 +168,7 @@ def download(url, folder, *, best, audio, check, progress):
     files = [p for p in folder.glob("source.*") if p.suffix.lower() in MEDIA_EXTS and p.stat().st_size > 0]
     if not files:
         raise RuntimeError("视频下载完成但未找到媒体文件")
+    progress(100)
     return max(files, key=lambda p: p.stat().st_size)
 
 
@@ -205,17 +245,19 @@ def _load_whisper(model_name, device):
         return MODEL
 
 
-def transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None):
+def transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None, phase=None, duration=None):
     # Keep the model and its lazy inference iterator owned by one job.
+    if phase:
+        phase("waiting", None)
     while not ASR_LOCK.acquire(timeout=.25):
         check()
     try:
-        return _transcribe(path, folder, check, progress, settings=settings, warning=warning)
+        return _transcribe(path, folder, check, progress, settings=settings, warning=warning, phase=phase, duration=duration)
     finally:
         ASR_LOCK.release()
 
 
-def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None):
+def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None, phase=None, duration=None):
     settings = settings or {}
     model_name = settings.get("whisper_model", "small")
     requested = settings.get("whisper_device", "auto")
@@ -225,7 +267,12 @@ def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda 
     if not audio.exists():
         temporary_audio = folder / "audio.partial.wav"
         try:
-            command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", str(temporary_audio)], check)
+            args = ["ffmpeg", "-y", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", str(temporary_audio)]
+            if phase:
+                phase("audio", 0 if duration else None)
+                ffmpeg_command(args, check, duration=duration, progress=lambda p: phase("audio", p))
+            else:
+                command(args, check)
             temporary_audio.replace(audio)
         finally:
             temporary_audio.unlink(missing_ok=True)
@@ -236,16 +283,23 @@ def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda 
 
     def recognize(actual_device):
         check()
+        if phase:
+            phase("model", None)
         model = _load_whisper(model_name, actual_device)
+        progress(0)
         stream, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, language=None, word_timestamps=True)
         result = []
+        last = 0
         for segment in stream:
             check()
             text = segment.text.strip()
             if text:
                 words = getattr(segment, "words", None)
                 result.extend(word_cues(words) if words else [dict(start=segment.start, end=segment.end, text=text)])
-            progress(min(99, int(segment.end / max(info.duration, 1) * 100)))
+            percent = max(last, min(99, int(segment.end / max(info.duration, .001) * 100)))
+            if percent > last:
+                progress(percent)
+                last = percent
         return result, info
 
     try:
@@ -261,6 +315,7 @@ def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda 
         raise ValueError("未识别到有效语音，请检查音轨；静音视频无法自动生成字幕")
     from .storage import atomic_json
     atomic_json(folder / "whisper-runtime.json", {"model": model_name, "device": device})
+    progress(100)
     return result, info.language
 
 
@@ -337,18 +392,20 @@ def candidates(path, chapter, output, index, used, check):
     return diverse[:4]
 
 
-def embed(path, zh, en, target, check):
-    streams = probe(path).get("streams", [])
+def embed(path, zh, en, target, check, *, progress=None):
+    details = probe(path)
+    streams = details.get("streams", [])
+    duration = float(details.get("format", {}).get("duration") or 0)
     video = next((s for s in streams if s.get("codec_type") == "video"), {})
     audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
     video_codec = "copy" if video.get("codec_name") in {"h264", "hevc", "av1", "vp9", "mpeg4"} else "libx264"
     audio_codec = "copy" if audio.get("codec_name") in {"aac", "mp3", "alac"} else "aac"
     # MP4 soft subtitles use mov_text. Preserve resolution and compatible streams.
-    command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(zh), "-i", str(en),
+    ffmpeg_command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(zh), "-i", str(en),
              "-map", "0:v?", "-map", "0:a?", "-map", "1:0", "-map", "2:0", "-c:v", video_codec, "-c:a", audio_codec, "-c:s", "mov_text", "-movflags", "+faststart",
              "-metadata:s:s:0", "language=zho", "-metadata:s:s:0", "title=简体中文",
              "-metadata:s:s:1", "language=eng", "-metadata:s:s:1", "title=English",
-             "-disposition:s:0", "default", "-disposition:s:1", "0", str(target)], check)
+             "-disposition:s:0", "default", "-disposition:s:1", "0", str(target)], check, duration=duration, progress=progress)
     streams = probe(target).get("streams", [])
     languages = {s.get("tags", {}).get("language") for s in streams if s.get("codec_type") == "subtitle"}
     if not {"zho", "eng"} <= languages:

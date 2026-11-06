@@ -102,6 +102,11 @@ def list_tasks():
     return store.list()
 
 
+@secured.get("/workspace")
+def workspace():
+    return store.history_status()
+
+
 @secured.get("/tasks/{job_id}")
 def task(job_id: str):
     return get_job(job_id)

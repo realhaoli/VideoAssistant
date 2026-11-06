@@ -1,5 +1,7 @@
 import copy
 import json
+import logging
+import math
 import os
 import queue
 import re
@@ -15,6 +17,7 @@ from .storage import atomic_json, open_shared_read
 
 MODES = {"illustrated", "text", "mindmap", "subtitles", "download"}
 ACTIVE = {"uploading", "queued", "running", "cancelling"}
+LOGGER = logging.getLogger(__name__)
 
 
 class Cancelled(Exception):
@@ -57,6 +60,8 @@ class JobStore:
         self.worker_count = max(1, min(8, int(workers or os.getenv("TASK_WORKERS", "2"))))
         self.stopping = threading.Event()
         self.owner = None
+        self.history_recovered = 0
+        self.history_unreadable = 0
 
     @staticmethod
     def folder_name(title):
@@ -102,30 +107,48 @@ class JobStore:
             self.root.mkdir(parents=True, exist_ok=True)
             self._claim_service()
             self.stopping.clear()
-            for path in sorted(self.root.glob("*/task.json")):
+            self.jobs, self.paths, self.readers = {}, {}, {}
+            self.history_recovered = self.history_unreadable = 0
+            for directory in sorted(p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')):
+                job = None
+                for filename in ("task.json", "task.backup.json"):
+                    try:
+                        job = self._read_record(directory / filename)
+                        if filename == "task.backup.json":
+                            self.history_recovered += 1
+                            LOGGER.warning("已从备份恢复任务记录：%s", directory)
+                        break
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        LOGGER.warning("无法读取任务记录 %s：%s", directory / filename, type(exc).__name__)
+                if job is None:
+                    self.history_unreadable += 1
+                    continue
                 try:
-                    job = json.loads(path.read_text(encoding="utf-8"))
                     job_id = job["id"]
-                    folder = path.parent
+                    folder = directory
                     # Migrate old UUID-only directories once, before requests
                     # or workers start. Public IDs and URLs remain unchanged.
                     if folder.name == job_id:
-                        target = self._new_folder(job["title"])
-                        target.rmdir()
-                        folder.rename(target)
-                        folder = target
+                        try:
+                            target = self._new_folder(job["title"])
+                            target.rmdir()
+                            folder.rename(target)
+                            folder = target
+                        except OSError:
+                            # A cosmetic folder migration must not hide history.
+                            LOGGER.warning("保留原任务目录，无法重命名：%s", folder)
                     self.jobs[job_id], self.paths[job_id] = job, folder
                     self.readers[job_id] = 0
                     job["storage_folder"] = folder.name
                     if job["status"] == "uploading":
-                        job.update(status="failed", message="上传未完成，请重新提交文件")
+                        job.update(status="failed", stage_progress=None, message="上传未完成，请重新提交文件")
                     elif job["status"] == "cancelling":
-                        job.update(status="cancelled", message="任务已取消")
+                        job.update(status="cancelled", stage_progress=None, message="任务已取消")
                     elif job["status"] in {"running", "queued"}:
-                        job.update(status="queued", message="服务恢复，等待继续处理")
+                        job.update(status="queued", stage_progress=None, message="服务恢复，等待继续处理")
                     self._persist(job)
-                except (ValueError, KeyError, OSError):
-                    continue
+                except OSError:
+                    LOGGER.exception("任务已读取，但无法保存恢复状态：%s", directory)
             # Clear stale in-memory queue entries before reconstructing it.
             self.queue = queue.Queue()
             for job in sorted(self.jobs.values(), key=lambda item: item["created_at"]):
@@ -135,6 +158,36 @@ class JobStore:
             self.worker = self.workers[0]
             for thread in self.workers:
                 thread.start()
+
+    @staticmethod
+    def _read_record(path):
+        job = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(job, dict):
+            raise ValueError("任务记录不是对象")
+        for key in ("id", "title", "status"):
+            if not isinstance(job.get(key), str) or not job[key]:
+                raise ValueError("任务记录缺少有效字段：" + key)
+        if not isinstance(job.get("created_at"), (int, float)) or not math.isfinite(job["created_at"]):
+            raise ValueError("任务记录缺少有效创建时间")
+        for key, expected in (("modes", list), ("source", dict), ("options", dict)):
+            if not isinstance(job.get(key), expected):
+                raise ValueError("任务记录字段无效：" + key)
+        for key in ("artifacts", "events", "warnings"):
+            if not isinstance(job.get(key, []), list):
+                raise ValueError("任务记录字段无效：" + key)
+            job.setdefault(key, [])
+        progress = job.get("progress", 100 if job["status"] == "completed" else 0)
+        job["progress"] = max(0, min(100, progress)) if isinstance(progress, (int, float)) and math.isfinite(progress) else 0
+        stage_progress = job.get("stage_progress")
+        job["stage_progress"] = max(0, min(100, stage_progress)) if isinstance(stage_progress, (int, float)) and math.isfinite(stage_progress) else None
+        job.setdefault("message", "已恢复历史任务")
+        job.setdefault("updated_at", job["created_at"])
+        return job
+
+    def history_status(self):
+        with self.lock:
+            return {"task_count": len(self.jobs), "recovered_tasks": self.history_recovered,
+                    "unreadable_tasks": self.history_unreadable}
 
     def stop(self, timeout=15):
         self.stopping.set()
@@ -155,6 +208,10 @@ class JobStore:
     def _persist(self, job):
         folder = self.directory(job["id"])
         atomic_json(folder / "task.json", job)
+        try:
+            atomic_json(folder / "task.backup.json", job)
+        except OSError:
+            LOGGER.exception("任务记录已保存，但无法更新备份：%s", folder)
 
     def create(self, *, modes, source, options, title="新任务", enqueue=True):
         if not modes or not set(modes) <= MODES:
@@ -164,7 +221,7 @@ class JobStore:
             self.root.mkdir(parents=True, exist_ok=True)
             folder = self._new_folder(title)
             job = dict(id=job_id, title=title, modes=list(dict.fromkeys(modes)), source=copy.deepcopy(source),
-                       options=copy.deepcopy(options), status="queued" if enqueue else "uploading", progress=0, stage="queued", message="等待处理",
+                       options=copy.deepcopy(options), status="queued" if enqueue else "uploading", progress=0, stage="queued", stage_progress=None, message="等待处理",
                        created_at=time.time(), updated_at=time.time(), artifacts=[], events=[], warnings=[], storage_folder=folder.name)
             self.jobs[job_id], self.paths[job_id], self.readers[job_id] = job, folder, 0
             # This private snapshot never appears in task API responses.
@@ -209,6 +266,8 @@ class JobStore:
     def update(self, job_id, **fields):
         with self.lock:
             job = self.jobs[job_id]
+            if ("message" in fields or "stage" in fields) and "stage_progress" not in fields:
+                fields["stage_progress"] = None
             if "title" in fields and job.get("custom_title") and "custom_title" not in fields:
                 fields["title"] = job["custom_title"]
             job.update(fields, updated_at=time.time())
@@ -222,12 +281,16 @@ class JobStore:
             self.update(job_id, title=title, custom_title=title)
             return self.get(job_id)
 
-    def progress(self, job_id, stage, percent, message):
+    def progress(self, job_id, stage, percent, message, *, stage_progress=None):
         self.check(job_id)
         with self.lock:
             job = self.jobs[job_id]
-            job.update(stage=stage, progress=max(job["progress"], min(percent, 99)), message=message, updated_at=time.time())
-            event = dict(time=time.time(), stage=stage, message=message)
+            stage_progress = max(0, min(100, stage_progress)) if stage_progress is not None else None
+            total = max(job["progress"], min(percent, 99))
+            if job.get("stage") == stage and job["progress"] == total and job.get("stage_progress") == stage_progress and job.get("message") == message:
+                return
+            job.update(stage=stage, progress=total, stage_progress=stage_progress, message=message, updated_at=time.time())
+            event = dict(time=time.time(), stage=stage, message=message, stage_progress=stage_progress)
             previous = job["events"][-1] if job["events"] else None
             if previous and previous["stage"] == stage and re.sub(r"\d+%", "%", previous["message"]) == re.sub(r"\d+%", "%", message):
                 job["events"][-1] = event
@@ -314,7 +377,7 @@ class JobStore:
                     self.update(job_id, status="running", message="开始处理")
                 run(self, job_id)
                 self.check(job_id)
-                self.update(job_id, status="completed", progress=100, stage="completed", message="处理完成，可以下载")
+                self.update(job_id, status="completed", progress=100, stage="completed", stage_progress=100, message="处理完成，可以下载")
             except ServiceStopping:
                 if job_id in self.jobs:
                     self.update(job_id, status="queued", message="服务暂停，等待恢复处理")

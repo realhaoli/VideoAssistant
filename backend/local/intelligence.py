@@ -255,18 +255,26 @@ class Intelligence:
             mapping[cue_id] = item.get("text")
         return {key: value for key, value in mapping.items() if key not in duplicates}
 
-    def plan(self, segments, duration, options, metadata, checkpoint):
+    def plan(self, segments, duration, options, metadata, checkpoint, progress=lambda n: None):
         if checkpoint.exists():
-            return json.loads(checkpoint.read_text(encoding="utf-8"))
+            value = json.loads(checkpoint.read_text(encoding="utf-8"))
+            progress(1)
+            return value
         batches = self.bounded_segments(segments, 4800)
         if len(batches) == 1:
             try:
-                return self._plan_small(segments, duration, options, metadata, checkpoint)
+                value = self._plan_small(segments, duration, options, metadata, checkpoint)
+                progress(1)
+                return value
             except ModelLimitError:
                 batches = list(self.split_batch(segments))
         chapters = []
         titles = []
+        total = sum(max(1, len(cue["text"])) for cue in segments)
+        completed = 0
+        progress(0)
         def window(batch, label):
+            nonlocal completed
             path = checkpoint.with_name(checkpoint.stem + "-window-" + label + ".json")
             try:
                 value = self._plan_small(batch, batch[-1]["end"], options, metadata, path)
@@ -280,6 +288,8 @@ class Intelligence:
                 # Local planner IDs must be remapped to actual global cues.
                 anchor = batch[chapter["start_id"]]
                 chapter["start_id"] = next(i for i, cue in enumerate(segments) if cue["start"] == anchor["start"] and cue["end"] == anchor["end"])
+            completed += sum(max(1, len(cue["text"])) for cue in batch)
+            progress(min(.99, completed / max(1, total)))
             return result
         for index, batch in enumerate(batches):
             self.check()
@@ -293,6 +303,7 @@ class Intelligence:
             chapter["end"] = unique[index+1]["start"] if index+1 < len(unique) else duration
         result = {"title": str(titles[0] if titles else metadata.get("title") or "视频技术汇报"), "summary": "", "chapters": unique}
         atomic_json(checkpoint, result)
+        progress(1)
         return result
 
     def _plan_small(self, segments, duration, options, metadata, checkpoint):

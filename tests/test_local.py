@@ -118,7 +118,10 @@ def test_real_mp4_has_two_switchable_subtitle_tracks(tmp_path):
     zh, en = tmp_path/'zh.srt', tmp_path/'en.srt'
     zh.write_text(subtitles.srt(cues), encoding="utf-8"); en.write_text(subtitles.srt([dict(cues[0], text='English subtitle')]), encoding="utf-8")
     result = tmp_path/'result.mp4'
-    media.embed(video, zh, en, result, lambda: None)
+    progress = []
+    media.embed(video, zh, en, result, lambda: None, progress=progress.append)
+    assert progress[0] == 0 and progress[-1] == 100
+    assert progress == sorted(set(progress))
     streams = media.probe(result)['streams']
     tracks = [s for s in streams if s['codec_type'] == 'subtitle']
     assert {s['tags']['language'] for s in tracks} == {'zho','eng'}
@@ -385,7 +388,7 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
         return [dict(path=target,time=2,hash=0,quality=10)]
     monkeypatch.setattr(media,'candidates',candidates)
     monkeypatch.setattr(Intelligence,'select',lambda self,ch,images,body:[dict(index=0,candidate=images[0],caption='系统示意',reason='相关')])
-    monkeypatch.setattr(media,'embed',lambda path,zh,en,target,check:target.write_bytes(b'mp4'))
+    monkeypatch.setattr(media,'embed',lambda path,zh,en,target,check,**kwargs:target.write_bytes(b'mp4'))
     monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     pipeline.run(jobs,task['id'])
     artifacts=jobs.get(task['id'])['artifacts']

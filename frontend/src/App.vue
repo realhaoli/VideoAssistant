@@ -40,6 +40,7 @@ const tasks = ref([]),
   models = ref(null),
   modelBusy = ref(false);
 const statusError = ref("");
+const historyRecovery = ref({ recovered_tasks: 0, unreadable_tasks: 0 });
 const activeTask = computed(() =>
   tasks.value.find((t) => t.id === selectedId.value),
 );
@@ -64,9 +65,15 @@ const canSubmit = computed(
     !submitting.value,
 );
 const progressText = (message = "") => message.replace(/Whisper\s+(?:large-v3-turbo|large-v3|medium|small|base|tiny)\s+(?=转写|本地转写)/g, "Whisper ");
-const stageProgressText = computed(() =>
-  progressText(activeTask.value?.message || "等待处理").replace(/[\s，,]*(\d+(?:\.\d+)?)%$/, "，$1%"),
-);
+const stageProgressText = computed(() => {
+  const task = activeTask.value;
+  const message = progressText(task?.message || "等待处理");
+  if (typeof task?.stage_progress === "number" && Number.isFinite(task.stage_progress)) {
+    const label = message.replace(/[\s，,]*\d+(?:\.\d+)?%$/, "");
+    return `${label}，${Math.round(task.stage_progress)}%`;
+  }
+  return message.replace(/[\s，,]*(\d+(?:\.\d+)?)%$/, "，$1%");
+});
 const statusName = (state) =>
   ({
     queued: "等待处理",
@@ -117,7 +124,12 @@ async function api(path, options = {}) {
 }
 async function refresh() {
   try {
-    tasks.value = await api("/tasks");
+    const [items, workspace] = await Promise.all([
+      api("/tasks"),
+      api("/workspace").catch(() => null),
+    ]);
+    tasks.value = items;
+    if (workspace) historyRecovery.value = workspace;
     statusError.value = "";
   } catch (error) {
     statusError.value = error.message;
@@ -415,6 +427,10 @@ onBeforeUnmount(() => clearInterval(timer));
           重新连接
         </button>
       </div>
+      <div v-if="historyRecovery.recovered_tasks || historyRecovery.unreadable_tasks" class="history-recovery" role="status">
+        <span v-if="historyRecovery.recovered_tasks">已从备份恢复 {{ historyRecovery.recovered_tasks }} 条历史任务。</span>
+        <span v-if="historyRecovery.unreadable_tasks">有 {{ historyRecovery.unreadable_tasks }} 个任务目录的记录无法读取，原文件已保留，请检查服务器数据目录和启动日志。</span>
+      </div>
 
       <div v-if="view === 'new'" class="page new-page">
         <div class="page-heading new-task-heading"><h1>新建处理任务</h1></div>
@@ -598,7 +614,7 @@ onBeforeUnmount(() => clearInterval(timer));
         <div v-if="!tasks.length" class="empty-state">
           <el-icon><FolderOpened /></el-icon>
           <h2>暂无任务</h2>
-          <p></p>
+          <p>历史记录保存在运行服务的电脑上；更换设备或项目目录时，需要一起迁移本地数据。</p>
           <button class="primary" @click="newTask">添加素材</button>
         </div>
         <div

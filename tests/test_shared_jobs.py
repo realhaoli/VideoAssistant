@@ -170,11 +170,18 @@ def test_long_planning_splits_recursively_and_keeps_global_boundaries(tmp_path):
             raise ModelLimitError('context')
         return {'title':'中文技术汇报','chapters':[{'title':'实质技术结论', 'start_id':0, 'start':0, 'end':duration}]}
     engine._plan_small = small
-    result = engine.plan(source, 400, {}, {}, tmp_path/'plan.json')
+    progress = []
+    result = engine.plan(source, 400, {}, {}, tmp_path/'plan.json', progress.append)
+    assert progress[0] == 0 and progress[-1] == 1
+    assert progress == sorted(progress) and any(0 < value < 1 for value in progress)
     assert result['chapters'][0]['start'] == 0 and result['chapters'][-1]['end'] == 400
     assert result['chapters'][-1]['start_id'] > 30
     assert all(a['end'] == b['start'] for a,b in zip(result['chapters'],result['chapters'][1:]))
     assert max(calls) < len(source)
+    count = len(calls)
+    progress.clear()
+    assert engine.plan(source, 400, {}, {}, tmp_path/'plan.json', progress.append) == result
+    assert len(calls) == count and progress == [1]
 
 
 def test_long_drafts_split_on_limits_and_reuse_successful_parts(tmp_path):
@@ -310,6 +317,12 @@ def test_report_with_video_download_accepts_audio_only_analysis_cache(tmp_path, 
     from local import pdf_export
     jobs = JobStore(tmp_path/'tasks')
     job = jobs.create(modes=[report_mode,'download'], source={'type':'url','url':'https://example.test/video'}, options={'clean_subtitles':False}, title='example.test', enqueue=False)
+    updates = []
+    original_progress = jobs.progress
+    def record(job_id, stage, percent, message, **kwargs):
+        updates.append((stage, kwargs.get('stage_progress')))
+        return original_progress(job_id, stage, percent, message, **kwargs)
+    monkeypatch.setattr(jobs, 'progress', record)
     monkeypatch.setattr(media, 'inspect_url', lambda *args:({'title':'技术分析','duration':5}, {}))
     downloads = []
     def download(url, folder, *, best, audio, **kwargs):
@@ -325,15 +338,22 @@ def test_report_with_video_download_accepts_audio_only_analysis_cache(tmp_path, 
     monkeypatch.setattr(Intelligence, 'plan', lambda *args:{'title':'电池技术','chapters':[{'title':'电池容量','start':0,'end':5,'points':['容量100kWh']}]})
     monkeypatch.setattr(Intelligence, 'draft', lambda *args:'电池容量100kWh。')
     monkeypatch.setattr(Intelligence, 'overview', lambda *args:{'one_sentence':'电池容量100kWh。','key_conclusions':[],'data_terms':[]})
-    monkeypatch.setattr(Intelligence, 'transform', lambda *args,**kwargs:cues)
+    def transform(*args, **kwargs):
+        if 'progress' in kwargs:
+            kwargs['progress'](.5)
+        return cues
+    monkeypatch.setattr(Intelligence, 'transform', transform)
     monkeypatch.setattr(pdf_export, 'render', lambda folder, check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
-    def embed(source, zh, en, target, check):
+    def embed(source, zh, en, target, check, **kwargs):
         assert source.suffix == '.mp4' and source.parent.name == 'original'
+        kwargs['progress'](50)
         target.write_bytes(b'video')
     monkeypatch.setattr(media, 'embed', embed)
     pipeline.run(jobs, job['id'])
     assert downloads == [(False,True),(True,False)]
     assert (jobs.directory(job['id'])/'output/video.mp4').read_bytes() == b'video'
+    assert ('translate_en', 50) in updates and ('translate_en', 100) in updates
+    assert ('embed', 50) in updates and ('embed', 100) in updates
     assert {a['name'] for a in jobs.get(job['id'])['artifacts']} == ({'text.html','text.md','video.mp4'} if report_mode=='text' else {'mindmap.pdf','video.mp4'})
 
 

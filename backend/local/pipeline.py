@@ -24,7 +24,8 @@ def run(store, job_id):
     output.mkdir(exist_ok=True)
     check = lambda: store.check(job_id)
     warn = lambda message: store.warn(job_id, message)
-    progress = lambda stage, percent, message: store.progress(job_id, stage, percent, message)
+    def progress(stage, percent, message, stage_percent=None):
+        store.progress(job_id, stage, percent, message, stage_progress=stage_percent)
     modes, options = set(job["modes"]), job["options"]
     exports.normalize_outputs(folder, modes)
     intelligence = Intelligence(store.settings(job_id), check, checkpoint_dir=folder / "subtitle-batches", warning=warn)
@@ -57,9 +58,9 @@ def run(store, job_id):
         has_reports = bool(modes & {"illustrated", "text", "mindmap"})
         need_video = "illustrated" in modes or ("download" in modes and not has_reports)
         if need_video or not tracks or ("download" in modes and not has_reports):
-            progress("download", 8, "下载最高画质视频" if "download" in modes and not has_reports else "下载分析所需的视频" if need_video else "没有可用字幕，下载音频用于本地转写")
+            progress("download", 8, "下载最高画质视频" if "download" in modes and not has_reports else "下载分析所需的视频" if need_video else "没有可用字幕，下载音频用于本地转写", 0)
             media_path = media.download(source["url"], folder, best="download" in modes and not has_reports, audio=not need_video,
-                                        check=check, progress=lambda p: progress("download", 8 + p * .14, f"素材下载 {p}%"))
+                                        check=check, progress=lambda p: progress("download", 8 + p * .14, f"素材下载 {p}%", p))
     else:
         media_path = folder / source["filename"]
         if source.get("subtitle"):
@@ -90,15 +91,24 @@ def run(store, job_id):
         if media_path is None:
             raise ValueError("未找到可供转写的音视频")
         model_name = intelligence.config.get("whisper_model", "small")
-        progress("transcribe", 24, "读取本地转写结果" if (folder / "whisper.json").exists() else "Whisper 本地转写")
+        progress("transcribe", 22, "读取本地转写结果" if (folder / "whisper.json").exists() else "准备 Whisper 本地转写")
 
         def speech():
+            def prepare(phase, percent):
+                if phase == "audio":
+                    progress("audio", 22 + (percent or 0) * .02, "提取转写音轨", percent)
+                elif phase == "model":
+                    progress("whisper_model", 24, "加载 Whisper 模型（首次使用可能需要下载）")
+                elif phase == "waiting":
+                    progress("transcribe_wait", 22, "等待 Whisper 转写资源")
             segments, lang = media.transcribe(media_path, folder, check,
-                                               lambda p: progress("transcribe", 24 + p * .2, f"Whisper 转写 {p}%"), settings=intelligence.config, warning=warn)
+                                               lambda p: progress("transcribe", 24 + p * .2, f"Whisper 转写 {p}%", p),
+                                               settings=intelligence.config, warning=warn, phase=prepare, duration=metadata.get("duration"))
             runtime_path = folder / "whisper-runtime.json"
             runtime = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.exists() else {}
             return {"segments": segments, "language": lang, "model": model_name, "device": runtime.get("device", "cpu")}
         speech_data = cached(folder / "whisper.json", speech)
+        progress("transcribe", 44, "Whisper 转写完成", 100)
         lang = speech_data["language"]
         tracks["zh" if lang.startswith("zh") else "en" if lang.startswith("en") else "original"] = speech_data["segments"]
         transcript_source = "Whisper 本地转写"
@@ -114,11 +124,13 @@ def run(store, job_id):
     progress("transcript", 45, f"已取得字幕：{transcript_source}")
     zh = tracks.get("zh")
     if zh is None:
-        progress("translate", 46, "将原始字幕翻译为简体中文，保留时间轴")
-        zh = cached(folder / "translated.zh.json", lambda: intelligence.transform(raw, language="zh", progress=lambda p: progress("translate", 46 + p * 2, f"翻译中文字幕 {round(p * 100)}%")))
+        progress("translate", 46, "翻译中文字幕", 0)
+        zh = cached(folder / "translated.zh.json", lambda: intelligence.transform(raw, language="zh", progress=lambda p: progress("translate", 46 + p * 2, f"翻译中文字幕 {round(p * 100)}%", p * 100)))
+        progress("translate", 48, "翻译中文字幕", 100)
     if options.get("clean_subtitles", True):
-        progress("clean", 49, "处理中文字幕")
-        zh = cached(folder / "cleaned.zh.json", lambda: intelligence.transform(zh, clean=True, progress=lambda p: progress("clean", 49 + p * 6, f"字幕清洗 {round(p * 100)}%")))
+        progress("clean", 49, "字幕清洗", 0)
+        zh = cached(folder / "cleaned.zh.json", lambda: intelligence.transform(zh, clean=True, progress=lambda p: progress("clean", 49 + p * 6, f"字幕清洗 {round(p * 100)}%", p * 100)))
+        progress("clean", 55, "字幕清洗", 100)
     if not zh:
         raise ValueError("字幕仅含语气词，没有可生成汇报的有效内容；原始字幕已保留")
     (folder / "subtitles.zh.srt").write_text(subtitles.srt(zh), encoding="utf-8")
@@ -129,13 +141,15 @@ def run(store, job_id):
 
     if modes & {"illustrated", "text", "mindmap"}:
         progress("chapters", 60, "按完整内容组织中文汇报章节")
-        plan = intelligence.plan(zh, metadata["duration"], options, metadata, folder / f"plan-{VERSION}.json")
+        plan = intelligence.plan(zh, metadata["duration"], options, metadata, folder / f"plan-{VERSION}.json",
+                                 lambda p: progress("chapters", 60 + p * 3, "组织汇报章节", p * 100))
         store.update(job_id, report_title=plan["title"])
         (folder / "chapters.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         if modes & {"illustrated", "text", "mindmap"}:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             parts, illustrated_parts, used = [], [], []
             chapters = plan["chapters"]
+            progress("report", 63, f"已完成 0/{len(chapters)} 章正文与配图评选", 0)
 
             def chapter_work(index, chapter):
                 check()
@@ -182,7 +196,8 @@ def run(store, job_id):
                             pending.cancel()
                         raise
                     results[index] = (chapter, body, ranked)
-                    progress("report", 63 + len(results) / len(chapters) * 28, f"已完成 {len(results)}/{len(chapters)} 章正文与配图评选")
+                    progress("report", 63 + len(results) / len(chapters) * 28,
+                             f"已完成 {len(results)}/{len(chapters)} 章正文与配图评选", len(results) / len(chapters) * 100)
             selections = []
             for index in range(len(chapters)):
                 chapter, body, ranked = results[index]
@@ -229,24 +244,29 @@ def run(store, job_id):
     if "download" in modes:
         progress("bilingual", 93, "准备中英双字幕轨")
         if source["type"] == "url" and modes & {"illustrated", "text", "mindmap"}:
-            progress("download", 92, "汇报已可下载，继续下载最高画质视频")
+            progress("download", 93, "汇报已可下载，继续下载最高画质视频", 0)
             original = folder / "original"
             original.mkdir(exist_ok=True)
             media_path = media.download(source["url"], original, best=True, audio=False, check=check,
-                                        progress=lambda p: progress("download", 92, f"汇报已可下载，最高画质视频下载 {p}%"))
+                                        progress=lambda p: progress("download", 93 + p * .01, f"汇报已可下载，最高画质视频下载 {p}%", p))
         en = tracks.get("en")
         if en is None:
-            en = cached(folder / "translated.en.json", lambda: intelligence.transform(zh, language="en"))
+            progress("translate_en", 94, "翻译英文字幕", 0)
+            en = cached(folder / "translated.en.json", lambda: intelligence.transform(zh, language="en",
+                        progress=lambda p: progress("translate_en", 94 + p, f"翻译英文字幕 {round(p * 100)}%", p * 100)))
+            progress("translate_en", 95, "翻译英文字幕", 100)
         (folder / "subtitles.en.srt").write_text(subtitles.srt(en), encoding="utf-8")
         final_video = output / "video.mp4"
         if not final_video.exists():
-            progress("embed", 94, "封装 MP4 视频与可切换中英字幕轨")
+            progress("embed", 95, "封装 MP4 视频与可切换中英字幕轨", 0)
             temporary = folder / "video.partial.mp4"
-            media.embed(media_path, folder / "subtitles.zh.srt", folder / "subtitles.en.srt", temporary, check)
+            media.embed(media_path, folder / "subtitles.zh.srt", folder / "subtitles.en.srt", temporary, check,
+                        progress=lambda p: progress("embed", 95 + p * .03, f"视频封装 {p}%", p))
             temporary.replace(final_video)
+            progress("embed", 98, "视频封装完成", 100)
         exports.publish(store, job_id)
 
-    progress("export", 95, "校验生成文件与资源路径")
+    progress("export", 99, "校验生成文件与资源路径")
     provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
                   "transcript_source": transcript_source, "language": "zh-CN", "whisper_model": store.get(job_id).get("whisper_model"),
                   "warnings": store.get(job_id)["warnings"]}
