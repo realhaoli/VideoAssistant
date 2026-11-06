@@ -281,7 +281,7 @@ def _load_whisper(model_name, device):
         import ctranslate2
         requested = os.getenv('WHISPER_COMPUTE_TYPE', 'auto')
         supported = ctranslate2.get_supported_compute_types('cuda')
-        compute_type = ('int8_float16' if 'int8_float16' in supported else 'float16') if requested == 'auto' else requested
+        compute_type = next((value for value in ('int8_float16','float16','int8_float32','int8','float32') if value in supported), None) if requested == 'auto' else requested
         if compute_type not in supported:
             raise ValueError('GPU 不支持配置的 Whisper 计算精度，将切换 CPU')
     key = (model_name, device, compute_type)

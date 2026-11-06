@@ -264,7 +264,7 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 
 ### RTX 3070 与 CPU 兜底
 
-可将 `variables_gpu_3070_template.env` 的参数合并进本机 `variables.env`。默认保持两个后台任务、一个 Whisper 推理，不因显卡存在而直接提高全部并发；GPU 主要加速本地转写，远程百炼/方舟请求仍受接口吞吐和并发限制。GPU 使用 `int8_float16`，CPU 使用 `int8`，CPU 线程默认 4。Whisper 模型默认 small，可在设置中按质量和显存需求调整。
+可将 `variables_gpu_3070_template.env` 的参数合并进本机 `variables.env`。这是可选部署模板，代码没有按 3070 或显卡名称硬编码，也可用于其他 CUDA 显卡。默认保持两个后台任务、一个 Whisper 推理，不因显卡存在而直接提高全部并发；GPU 主要加速本地转写，远程百炼/方舟请求仍受接口吞吐和并发限制。`WHISPER_COMPUTE_TYPE=auto` 查询设备实际支持的精度，优先 `int8_float16`，再选择支持的其他精度；CPU 使用 `int8`，CPU 线程默认 4。Whisper 模型默认 small，可在设置中按质量和显存需求调整。当前转写引擎未接入 AMD/Intel GPU 或 Apple MPS，这些机器自动使用 CPU。
 
 `WHISPER_DEVICE=auto` 优先 CUDA；显卡不可用、CUDA 初始化失败、精度不支持或推理失败时自动切回 CPU，即使设置为 `cuda` 也保留兜底。长任务一次回退后，本次运行后续分块直接使用 CPU，避免每块重复触发 GPU 错误。新一次继续任务可重新尝试修复后的 GPU。也可显式选择 `cpu`。当前 faster-whisper 的 GPU 依赖 CUDA 12 / cuDNN 9，安装说明以 [faster-whisper 官方文档](https://github.com/SYSTRAN/faster-whisper#gpu) 为准；没有对应运行库时仍可使用 CPU。
 

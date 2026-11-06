@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -22,6 +23,29 @@ from local.limits import request_budget
 from local.model_client import ModelLimitError
 from local.resources import FairLimiter
 from local.storage import atomic_json
+
+
+@pytest.mark.parametrize('supported,expected',[
+    ({'int8_float16','float16','float32'},'int8_float16'),
+    ({'float16','float32'},'float16'),
+    ({'int8_float32','float32'},'int8_float32'),
+    ({'float32'},'float32'),
+])
+def test_unknown_cuda_device_uses_supported_precision_not_gpu_name(tmp_path,monkeypatch,supported,expected):
+    calls=[]
+    monkeypatch.setenv('WHISPER_COMPUTE_TYPE','auto')
+    monkeypatch.setattr(media,'MODEL',None)
+    monkeypatch.setattr(media,'MODEL_KEY',None)
+    monkeypatch.setattr(media,'WHISPER_RUNTIME',{})
+    monkeypatch.setattr(media,'DATA',tmp_path)
+    monkeypatch.setitem(sys.modules,'ctranslate2',SimpleNamespace(get_supported_compute_types=lambda device:supported))
+    monkeypatch.setitem(sys.modules,'faster_whisper',SimpleNamespace(WhisperModel=lambda path,**kwargs:calls.append(kwargs) or object()))
+    media._load_whisper('small','cuda')
+    media._load_whisper('small','cuda')
+    assert len(calls)==1 and calls[0]['compute_type']==expected
+    assert calls[0]['device']=='cuda' and calls[0]['num_workers']==1
+    media._load_whisper('small','cpu')
+    assert calls[-1]['compute_type']=='int8' and calls[-1]['device']=='cpu'
 
 
 def test_two_hour_asr_resumes_chunks_and_keeps_cpu_fallback(tmp_path, monkeypatch):
