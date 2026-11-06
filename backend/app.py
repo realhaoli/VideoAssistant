@@ -1,92 +1,45 @@
-# -*- coding: UTF-8 -*-
-
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
+"""Video Assistant local web application. No database, OSS or remote ASR."""
+import os
 import time
-from typing import Optional
+from pathlib import Path
 
-import env
-from config.log import setup_logging, get_logger
-from core.exceptions import (
-    APIException,
-    api_exception_handler,
-    general_exception_handler,
-)
-from core.response import success_response, APIResponse
-from routers import llm, files, audio, secrets
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / 'variables.env')
 
-# 设置日志
-setup_logging(log_level="INFO")
-logger = get_logger(__name__)
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from local.jobs import store
+from local.config import DATA
+from routers.tasks import router
 
-app = FastAPI(
-    title="AI Media2Doc API",
-    description="Convert media files to documents using AI",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+app = FastAPI(title='Video Assistant · 中文讲解汇报', version='2.0.0')
+app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'], allow_origin_regex=r'http://(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+):5173', allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
+app.include_router(router)
 
-# 添加CORS中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.on_event('startup')
+def startup():
+    store.start()
 
+@app.on_event('shutdown')
+def shutdown():
+    store.stop()
 
-# 添加异常处理器
-app.add_exception_handler(APIException, api_exception_handler)
-app.add_exception_handler(Exception, general_exception_handler)
+@app.get('/health')
+def health():
+    return {'success': True, 'data': {'status': 'healthy', 'storage': 'local', 'timestamp': int(time.time())}}
 
+DIST = Path(__file__).resolve().parents[1] / 'frontend' / 'dist'
+if DIST.exists():
+    app.mount('/assets', StaticFiles(directory=DIST / 'assets'), name='assets')
 
-async def verify_web_access_password(
-    request_web_access_password: Optional[str] = Header(
-        None, alias="request-web-access-password"
-    )
-):
-    """验证访问密码"""
-    if (
-        env.WEB_ACCESS_PASSWORD
-        and request_web_access_password != env.WEB_ACCESS_PASSWORD
-    ):
-        logger.warning("Unauthorized access attempt")
-        raise HTTPException(
-            status_code=401, detail="Unauthorized: Invalid or missing web-access-token"
-        )
-    return True
+@app.get('/')
+def index():
+    if (DIST / 'index.html').exists():
+        return FileResponse(DIST / 'index.html')
+    return {'message': '请先构建前端，或使用 http://localhost:5173 开发服务'}
 
-
-# 注册路由
-app.include_router(
-    llm.router, prefix="/api/v1", dependencies=[Depends(verify_web_access_password)]
-)
-app.include_router(
-    files.router, prefix="/api/v1", dependencies=[Depends(verify_web_access_password)]
-)
-app.include_router(
-    audio.router, prefix="/api/v1", dependencies=[Depends(verify_web_access_password)]
-)
-
-app.include_router(
-    secrets.router, prefix="/api/v1", dependencies=[Depends(verify_web_access_password)]
-)
-
-
-@app.get("/health", response_model=APIResponse)
-async def health_check():
-    """健康检查接口"""
-    logger.info("Health check requested")
-    return success_response(
-        data={"status": "healthy", "timestamp": int(time.time())},
-        message="Service is healthy",
-    )
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     import uvicorn
-
-    logger.info("Starting AI Media2Doc API server...")
-    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run('app:app', host=os.getenv('HOST', '0.0.0.0'), port=8080)

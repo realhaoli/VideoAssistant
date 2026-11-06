@@ -1,6 +1,6 @@
 IMAGE_VERSION ?= latest
 
-PROJECT_NAME := ai-media2doc
+PROJECT_NAME := video-assistant
 MODULES := backend frontend
 ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 

@@ -6,7 +6,7 @@ on:
       - 'v*.*.*'
 
 env:
-  PROJECT_NAME: ai-media2doc
+  PROJECT_NAME: video-assistant
 
 jobs:
   build-and-push:

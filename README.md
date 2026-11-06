@@ -1,178 +1,278 @@
-<h1 align="center">
-  <p>
-  <img src="docs/images/readme_header.jpg" alt="logo">
-    </p>
-</h1>
+# Video Assistant · 中文讲解汇报工作台
 
-<p align="center">
-    <a href="https://hellogithub.com/repository/d869461d98d245d388b50e25b6a80dae" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=d869461d98d245d388b50e25b6a80dae&claim_uid=uT2Sc8Xli4PUA76" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
-</p>
+基于 Video Assistant 改造的完整本地 Web 应用。用户在浏览器中上传音视频或输入视频链接，创建任务、查看处理进度，预览并下载结果。适用于新品发布会、技术讲解、调研汇报和专家讲座。
 
-<p align="center">
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/Platform-Web-orange" alt="Web Platform">
-  <img src="https://img.shields.io/badge/Docker-Support-blue?logo=docker" alt="Docker Support">
-</p>
+**文件、任务状态、字幕与模型权重保存在运行本系统的电脑上。无需 OSS、数据库、Redis 或远程语音识别服务。** 只有文本整理、翻译及可选的多模态评图调用所配置的大模型 API；相关字幕和候选图会发送给该模型服务。
 
+## 五项功能
 
-### 📖 简介
+| 功能 | 默认行为 | 下载结果 |
+| --- | --- | --- |
+| 图文汇报 | 中文技术结论、机制与适量规格表；按正文评选原视频画面与封面 | 展示 HTML、MD；两项下载均为该图文报告完整 ZIP（HTML + MD + image/） |
+| 文字汇报 | 与图文汇报共享技术报告正文，不含插图 | HTML、MD |
+| 思维导图 | 沿用节点连线渲染，完整展开后输出 PDF | PDF |
+| 字幕文件 | 优先现有字幕；缺失时 Whisper 转写；外语翻译为中文并默认清洗 | 中文 TXT（保留时间标记） |
+| 视频下载 | 最高可用清晰度，优先 MP4/M4A，带可切换中英字幕轨 | MP4 |
 
-AI 视频图文创作助手是一款 Web 工具, 基于 AI 大模型, 一键将视频和音频转化为各种风格的文档, 无需登录注册, 前后端本地部署，以极低的成本体验 AI 视频/音频转风格文档服务。
+多项功能可以一起选择。可独立下载已完成文件，不必等待整个任务结束。图文汇报只针对有画面的视频；纯音频可生成文字汇报、导图和字幕。
 
+## 安装
 
-### ✨ 核心功能
+### 1. 环境要求
 
-- ✅ **完全开源**：MIT 协议授权，支持本地部署。
-- 🔒 **隐私保护**：无需登录注册，任务记录保存在本地
-- 💻 **前端处理**：采用 ffmpeg wasm 技术，无需本地安装 ffmpeg
-- 🎯 **多种风格支持**：支持小红书/公众号/知识笔记/思维导图/内容总结等多种文档风格支持。
-- 🤖 **AI 对话**：支持针对视频内容进行 AI 二次问答。
-- 🎬 **支持字幕导出**: 结果一键导出为字幕文件。
-- 🖼️ **智能截图**: 基于字幕信息智能截图并插入文章, 无需视觉大模型, 实现真正的图文并茂。
-- 🎨 **支持自定义 Prompt**：支持在前端自定义配置 prompt。
-- 🐳 **一键部署**：支持 Docker 一键部署。
-- 🔒 **支持设置访问密码**: 后端设置访问密码之后, 前端用户需要填写该密码才可以正常使用。
+- Python **3.12**（建议使用这一版本）。
+- Node.js **22 或更新版本**，用于构建 Vue 前端。
+- **FFmpeg 与 ffprobe**，应能在终端直接执行。
+- 推荐安装 [uv](https://docs.astral.sh/uv/)。
+- Whisper small 多语言权重约 500 MB，首次准备时需要联网。CPU 模式也能运行，速度取决于视频时长和硬件。
 
+macOS 可通过 Homebrew 安装系统工具：
 
-### 🔜 未来计划
-- 🎙️ 音频识别支持使用 fast-whisper 本地大模型处理，进一步降低成本
-
-### 👾 开发者的废话
-
-AI 视频创作助手源于我年初的一个想法, 作为一个喜欢阅读的人, 我更希望将一些视频内容转化为文字, 方便我进行二次阅读思考和总结记录笔记, 但市面上并没有一个好的工具来实现这个想法, 大多数工具都需要登录和付费, 我不太想在互联网上注册过多的账号, 同时也不想将自己想要总结的内容上传至除了云厂商之外的第三方平台，因此我开发了这个小应用，MIT 协议, 任何人都可以以极低的成本去体验音视频转文本。
-
-### 💬 哪里可以找到我
-公众号(韩数同学)
-<p align="left">
-    <img src="docs/images/wxgzh/hstx.jpg" alt="index" width="20%">
-</p>
-
-或者首页置顶 issue 加入微信交流群. 如果部署遇到问题，我下班之后看到后一般会回复。
-
-
-### 项目截图
-
-#### 全新设计的首页, 尽力之作
-
-<p align="center">
-    <img src="docs/images/index.jpg" alt="index" width="80%">
-</p>
-
-#### 全新功能: 支持智能截图并插入到文中对应位置(本地方案, 无需视觉大模型, 0成本)
-
-开启方式, 点击自定义设置->智能截图 选择打开。
-
-<p align="center">
-<img src="docs/images/screenshot.png" alt="task details" width="80%">
-</p>
-
-#### 全新设计的结果页, 支持一键导出为字幕。
-<p align="center">
-<img src="docs/images/details.png" alt="task details" width="80%">
-</p>
-
-#### 支持自定义 prompt
-<p align="center">
-<img src="docs/images/custom_prompt.png" alt="task details" width="80%">
-</p>
-
-
-
-### 📦 docker 本地一键部署
-0️⃣：安装 `docker`, 这个网上有教程, Windows 玩家建议使用 `wsl` 启动该项目。
-
-1️⃣：下载项目首页的 docker-compose.yaml 文件
-
-2️⃣：参考`variables_template.env` 在项目根目录下生成 `variables.env` 文件。 请根据 [后端部署指引 / 配置项说明](https://github.com/hanshuaikang/AI-Media2Doc/blob/main/backend/README.md#%E5%9C%A8%E7%81%AB%E5%B1%B1%E5%BC%95%E6%93%8E%E8%8E%B7%E5%8F%96%E5%AF%B9%E5%BA%94%E7%9A%84%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E7%9A%84%E5%80%BC) 完善 `variables.env` 文件中的环境变量。
-variables.env 必须与 docker-compose.yaml 在同一目录下, 建议建个新的文件夹单独存放这两个文件。
-
-3️⃣：运行, 在 docker-compose.yaml 所在目录下运行:
-
-```shell
-$ docker-compose -f docker-compose.yaml up -d
+```bash
+brew install python@3.12 node ffmpeg uv
 ```
 
+Ubuntu / Debian：
 
-### 🔧 本地开发指南
+```bash
+sudo apt update
+sudo apt install ffmpeg python3-venv fonts-noto-cjk
+# 另行安装 Python 3.12、Node.js 22+ 和 uv
+```
 
-- [后端本地部署](./backend/README.md)
-- [前端本地部署](./frontend/README.md)
+### 2. 安装后端与前端
 
+在本项目根目录执行：
 
-### 🤝 赞助
+```bash
+cd "/你的项目目录"
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r backend/requirements.txt
+PLAYWRIGHT_BROWSERS_PATH=data/browser .venv/bin/python -m playwright install chromium --only-shell
+cd frontend
+npm install
+npm run build
+cd ..
+```
 
-<table>
-  <thead>
-    <tr>
-      <th align="center" style="width: 150px;">
-        <a href="https://skywork.ai/p/mvVidS"><img src="./docs/images/sponsors/skywork.jpg" width="80px"><br>
-          <sub>天工超级智能体 1.0</sub><br>
-          <sub>调用海量工具完成各种任务</sub>
-        </a>
-      </th>
-    </tr>
-  </thead>
-</table>
+Linux 手动部署还需安装 Chromium 系统依赖：
 
+```bash
+PLAYWRIGHT_BROWSERS_PATH=data/browser .venv/bin/python -m playwright install --with-deps chromium --only-shell
+```
 
-### 🔄 处理流程
+后台导图 PDF 与网页使用同一个本地渲染器，完整展开后自动保存，不要求用户保持网页打开；导出全局单路运行以控制内存。Chromium 只处理本地导图数据，渲染时阻止所有外部请求。
 
-<p align="center">
-<img src="docs/images/process_flow.jpg" alt="architecture" width="80%">
-</p>
+如果没有 uv，可使用标准 Python 虚拟环境：
 
-### 🌵 支持开发者
-你可以关注我的小红书:
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+```
 
-[韩数同学： 致力于分享 Github 上那些好玩、有趣、免费、实用的高质量项目](https://www.xiaohongshu.com/user/profile/5e2992b000000000010064a4)
+依赖下载较慢时，可使用可信的镜像。例如：
 
-微信公众号: **韩数同学**
+```bash
+uv pip install --python .venv/bin/python \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  -r backend/requirements.txt
+```
 
-**或者请我吃一包辣条** , 作为一个超级喜欢吃辣条的人, 很多晚上维护开源项目都是边吃辣条边写代码的 🤪。如果你有很喜欢吃的辣条, 你可以投喂我吃一包辣条, 5毛一包的也可以, 我将直接开启代码狂暴模式(化身八爪鱼: 🐙)。
+### 3. 配置大模型
 
-请留下你要赞助作者的辣条名称 (🤩❤️‍🔥): 支持卫龙/麻辣王子/博士牛筋/臭干子，禁止投喂(🥵😵😵‍💫🤧🥴): **缺牙齿**/**霸王丝**等有损本人生命值的辣条。
+复制模板，编辑根目录的 `variables.env`：
 
-同时请备注你的 github 名称, 方便我整理展示在项目主页。🙌
+```bash
+cp variables_template.env variables.env
+chmod 600 variables.env
+```
 
-<p align="left">
- 赞助作者: <a href="https://afdian.com/a/hanshu-github">我的爱发电主页</a>
-</p>
+最小配置示例：
 
-[赞助名单](./docs/sponsors.md)
+```dotenv
+LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1
+MODEL_ID=hy-vision-2.0-instruct
+LLM_API_KEY=替换为你自己的Key
+HOST=0.0.0.0
+TASK_WORKERS=2
+```
 
-### 🙌 致谢
-感谢这些朋友对本项目做出的贡献:
+支持 OpenAI Chat Completions 兼容接口。此前配置好的密钥无需重新复制模板，以免覆盖已有配置。
 
-|  |  |                                                                                                                        |
-|:-:|:-:|:----------------------------------------------------------------------------------------------------------------------:|
-| <a href="https://github.com/ZhuoZhuoCrayon"><img src="https://github.com/ZhuoZhuoCrayon.png" width="50" height="50"/><br/>crayon</a> | <a href="https://github.com/cjx929"><img src="https://github.com/cjx929.png" width="50" height="50"/><br/>chen_jx</a> | <a href="https://github.com/LMseventeen"><img src="https://github.com/LMseventeen.png" width="50" height="50"/><br/>LMseventeen</a>  |
+可以在网页左下角的“模型设置”中分别设置大语言模型和多模态模型。每次打开都会读取服务器最新配置；只有一边有配置时，自动填到另一边，已存在的字段分别保留，缺失字段互相补齐。接口格式均明确选择 OpenAI 兼容或 Anthropic，不显示“沿用”选项。密钥在服务器端补齐，网页仅显示是否已配置，留空保存会保留已有密钥。共用模型时，该模型需要支持图片输入。也可以关闭多模态选图，退回清晰度与去重筛选。
 
-感谢以下自媒体对本项目的关注和转发(以下排名不分先后), 大家感兴趣的话可以关注下他们 ～
+配置保存到本地 `data/settings.json`，密钥文件权限为仅当前用户可读写。API 不向网页返回密钥。网页保存的设置优先于环境变量。
 
-| [HelloGithub](https://hellogithub.com)   |                           开源AI项目落地                            |                               [阮一峰的网络日志](https://www.ruanyifeng.com/blog/weekly/)                               |                               一飞开源                               |                             胖氪笔记                              |                          逛逛Github                            |                    小红书: 摸鱼的小李                            |
-|:----:|:-------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------:|:------------------------------------------------------------:|:-------------------------------------------------------------:|:------------------------------------------------------------:|:------------------------------------------------------------:|
-|<img src="docs/images/wxgzh/hellogithub.png" width="80" height="80"/>|<img src="docs/images/wxgzh/aild.png" width="80" height="80"/> |<img src="docs/images/wxgzh/ryf.png" width="80" height="80"/> | <img src="docs/images/wxgzh/yf.png" width="80" height="80"/> | <img src="docs/images/wxgzh/pk.png" width="80" height="80"/>  | <img src="docs/images/wxgzh/gg.png" width="80" height="80"/> | <img src="docs/images/wxgzh/myxl.png" width="80" height="80"/> 
+### 4. 准备 Whisper small
 
-小红书:
-[AI-GitHub](https://www.xiaohongshu.com/user/profile/65c44d1200000000090254fc) | [逛逛Github](https://www.xiaohongshu.com/user/profile/65e05165000000000500b059)
+```bash
+.venv/bin/python scripts/prepare-whisper.py
+```
 
+下载到 `data/models/faster-whisper-small/`。脚本支持断点重试；官方元数据可用时，会校验权重的 SHA-256。也可以不手动下载，首次转写时由 faster-whisper 准备模型。
 
-推特:
-| [Geek](https://x.com/geekbb) | [AIGCLINK](https://x.com/aigclink) | [ilovelife](https://x.com/ilovek8s) | [ahhhhfs](https://x.com/abskoop)
+在网页“模型设置 → 本地语音识别”中可选择 Tiny、Base、Small、Medium、Large-v3 或 Large-v3 Turbo，以及自动 / CPU / GPU（CUDA）。默认使用 small，并自动选择可用设备；无可用 GPU、GPU 初始化失败或推理失败时自动退回 CPU / int8。GPU 正常时使用 float16。Apple Silicon 的 MPS 不作为 CUDA GPU 使用，因此默认走 CPU。
 
-### 📄 许可证
+也可通过环境变量指定首次配置：
 
-本项目采用 [MIT 许可证](./LICENSE)
+```dotenv
+WHISPER_MODEL=small
+WHISPER_DEVICE=auto
+```
 
-### 🔗 相关链接
+更换模型会在下次需要转写的任务中生效；已缓存的转写继续复用，不会自动重跑。未缓存的模型会在首次使用时下载。
 
-- [volcengine-ai-app-lab](https://github.com/volcengine/ai-app-lab)
+## 启动与停止
 
-- [throttled-py](https://github.com/ZhuoZhuoCrayon/throttled-py)：✨Python 限流库，合理限制、平滑云资源用量。
+### 日常使用：一个地址提供网页与 API
 
-### 其他 AI 工具:
-[Owl 猫头鹰小红书/公众号敏感词检测工具](https://owl.hanshutx.com/): 支持小红书、公众号敏感词检测，提交检测后自动识别文本中的敏感词并高亮显示，避免笔记违规, 免费使用。
+前端构建后，在根目录执行：
 
-### 🌟 Star History
+```bash
+./start-local.sh
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=hanshuaikang/AI-Media2Doc&type=Date)](https://www.star-history.com/#hanshuaikang/AI-Media2Doc&Date)
+浏览器访问 **http://localhost:8080**。终端按 `Ctrl+C` 停止。也可以直接启动后端：
+
+```bash
+.venv/bin/python -m uvicorn app:app --app-dir backend --host 0.0.0.0 --port 8080
+```
+
+健康检查：`http://localhost:8080/health`；API 文档：`http://localhost:8080/docs`。
+
+### 局域网内其他电脑访问
+
+默认监听 `0.0.0.0:8080`，同一局域网可直接访问，不需要登录或访问密码：
+
+```bash
+HOST=0.0.0.0 ./start-local.sh
+```
+
+其他电脑访问 `http://运行本系统电脑的局域网IP:8080`。任务列表、产物与模型设置为共享工作台，没有用户账号或资源归属隔离。每个已提交任务有独立的源文件、模型配置快照、检查点和输出目录；修改模型设置只影响后续提交的任务。支持多人同时提交、预览和下载同一个资源。正在被读取的资源暂不能删除，下载结束后可删除。
+
+网页收到提交成功结果后，刷新、切换任务或关闭浏览器都不会终止后台任务。文件上传须先完成；关闭尚未完成的上传页面需要重新上传。服务必须持续运行，关闭服务器进程、电脑关机或休眠会暂停处理；重启后自动恢复排队中的任务，复用已完成的阶段检查点。长期部署可使用下文 `docker compose up -d --build`，容器配置了自动重启和本地数据挂载。
+
+正式部署由同一个 8080 端口提供网页、API 与文件，无需额外开放 5173。应用不限制访问主机名；若 localhost 正常但局域网地址超时，检查系统代理或 Proxifier 的局域网直连规则、服务器入站 8080 端口与路由器客户端隔离。使用 Nginx 等反向代理时，上传大小限制须与 `MAX_UPLOAD_MB`（默认 4096 MB）对应，并允许 PDF 补生成等请求的等待时间，例如 `proxy_read_timeout 300s`。任务运行不依赖持续 HTTP 连接。
+
+### 开发模式
+
+```bash
+./start-local.sh --dev
+```
+
+前端 `http://localhost:5173`，后端 `http://localhost:8080`。日志位于 `logs/`。修改前端代码后，正式使用前重新执行 `npm --prefix frontend run build`。
+
+## 使用
+
+1. 首页默认使用“视频链接”，也可切换到“上传文件”。两种输入区尺寸一致，字幕由系统自动检测和处理。
+2. 勾选一种或多种输出。
+   每个功能附有产物说明及参考耗时范围：图文汇报为视频时长的 1–2 倍，文字汇报和思维导图为 0.5–1.5 倍，字幕和视频下载为 0.5–1 倍。这些是参考预估，不是独立实测统计，不含排队时间；实际会受设备、字幕是否齐全、网速和模型速度影响，也可能超出范围。
+3. 内容场景自动判断，字幕清洗由默认提示词执行，主页不显示额外配置。
+4. 提交后，在任务详情中查看进度和生成文件。所有结果的“预览”均在新页面打开；Markdown 预览会渲染为正文，视频支持播放与定位。
+5. 已生成文件会陆续开放下载。失败任务可继续处理；已缓存的素材、转写和章节结果会复用。
+
+“视频下载”使用 **可切换字幕轨**，不将字幕烧录进画面。原素材没有中英字幕时，会补充本地转写和模型翻译。只有字幕轨校验通过才会提供最终 MP4。最高画质受平台授权、登录要求、来源分辨率和可用流限制；MP4 偏好不会把较高清晰度强行降为较低档。
+
+系统保留原始 SRT 和原时间轴，默认整理中文字幕。清洗只允许移除纯语气词；实质内容返回空值时保留原句。翻译缺失或为空时仅补译有问题的编号，不把原始英文充作中文结果。翻译/清洗的批次检查点保存在各任务的 `subtitle-batches/`，重试会复用已完成条目。模型要求保留人名、数字、型号、单位及否定关系，并对清洗前后的数字做检查。重要信息仍应结合原素材核对。
+
+## 图文汇报流程与效率
+
+本次参考了同目录的 `media_to_doc-1.3.0` 的阶段产物/断点思想、`video-devour` 的字幕优先与视觉选帧思路，以及 Video Assistant 的网页交互和思维导图组件，重新实现本地流水线，不引入其整套依赖。
+
+1. **字幕优先**：先检查平台字幕、本地内嵌文字字幕或配套字幕；缺失才下载音频并用所选 Whisper 模型转写（默认 small）。保留时间戳与原始版本。
+2. **中文整理**：外语字幕先翻译为简体中文，再默认清洗；长视频分块处理并汇总，不直接截断到视频前几分钟。
+3. **章节规划**：按实质技术主题与真实字幕编号划分章节，开场、场地和公司历史并入第一个实质章节。正文直接陈述技术结论、机制和数据；仅至少两项产品/技术客观规格时使用参数表，禁止用历史年数、场地面积等凑表。结论与关键数据从核对后的正文提炼。默认提示词位于 `backend/local/report_prompts.py`，图文与文字汇报共用。
+4. **正文与抽帧并行**：每章在其时间范围内取约 8 个候选画面，过滤低质量和相似画面，留下最多 4 张有差异的候选。
+正文生成后按原始字幕逐句核查，收紧没有依据的格式、效果和技术机制描述。
+
+5. **图文联合评审**：将实际章节正文、配图目标、候选图和真实时间戳一起提交多模态模型，返回排序、理由和中文图注。允许全部不合适，避免强行插图。
+6. **跨章去重**：按章节顺序选择没有重复使用的画面；图片放在对应章节的开头说明之后。封面单独用作首页素材，不替代各章节配图。
+7. **便携导出**：HTML 与 Markdown 都引用 `image/...jpg` 相对路径；图文 ZIP 只包含 `illustrated.html`、`illustrated.md`、实际使用的封面和配图，图片统一位于 `image/`。解压后保持文件结构即可离线打开。不会把文字报告、字幕、视频、导图和诊断文件混入图文包。打包前逐个检查图片引用，缺图直接报错。
+
+限流策略：默认 **2 个后台任务并行**，其余任务持久化排队；通过 `TASK_WORKERS=1–8` 调整，普通 CPU 服务器建议 1–2。每个任务最多 **2 个章节并行**；全服务共享 **2 个模型请求并发**和 **3 个 FFmpeg 抽帧并行**。Whisper 在模型加载与完整转写期间单路运行，避免多任务切换模型或争用显存。等待资源时可以取消任务，其他阶段可继续并行。模型请求不共享会话或内容。
+
+长内容处理：章节规划先按文字量和时间范围划小窗口，保留真实字幕时间和编号；正文按小段提取事实、撰写及核查后合并。全篇结论和选图所用长正文经过分层摘要。模型明确返回输入或输出长度超限时，先有限增加输出预算，再按阶段缩小分段重试，不将截断的 JSON 当成完整结果。已完成的规划窗口、正文分段、摘要与字幕批次单独保存，失败重试可复用。接口不可用、持续限流或最小请求仍不被模型支持时，任务保留检查点并显示失败原因。
+
+平台提供清晰度分档时，图文素材下载上限为 **1080p**。普通单文件直链没有分档可选时使用原文件，抽帧输出限制在 1920×1080 内。仅文字、导图或字幕任务如果有现成字幕，不下载完整视频；缺失字幕时只下载音频。
+
+同时选择汇报和最高画质视频下载时，先生成文档并开放下载，再下载最高画质视频，最后封装中英字幕 MP4。下载优先采用原生 MP4/M4A，并直接以 MP4 合并；只有编码确实不兼容时才转换相应流。字幕封装仍需要读写文件，但一般不重编码视频。
+
+## 本地保存位置
+
+```text
+data/
+├── settings.json                    # 私有模型配置
+├── models/faster-whisper-small/      # Whisper small 本地权重
+├── browser/                         # 本地 PDF 渲染运行时（Docker 位于镜像内）
+└── tasks/<任务名称>/                 # 同名追加 (2)、(3)；URL 使用唯一任务 ID
+    ├── task.json                    # 唯一 ID、状态、日志和可下载文件清单
+    ├── model-settings.json          # 提交时的私有模型配置快照，不对外下载
+    ├── subtitle-batches/            # 字幕、正文分段与摘要检查点（内部）
+    ├── source.*                     # 原始上传或分析素材
+    ├── platform.*.srt               # 已有平台字幕（若有）
+    ├── whisper.json                 # 本地转写结果（若有）
+    ├── plan-technical-*.json         # 章节检查点（内部）
+    ├── draft-*.md                   # 各章节正文检查点（内部）
+    ├── mindmap.json                 # 导图数据（内部）
+    ├── subtitles.*.srt              # 封装视频所需字幕（内部）
+    ├── frames-technical-*/          # 候选帧（内部）
+    └── output/                      # 仅所选功能的最终文件
+        ├── illustrated.html / .md
+        ├── illustrated.zip          # 仅此图文报告完整包
+        ├── image/                   # 实际配图和 cover.jpg
+        ├── text.md / text.html
+        ├── mindmap.pdf              # 后台使用原版导图渲染器自动生成
+        ├── subtitles.zh.txt
+        └── video.mp4                # 可切换中英字幕轨
+```
+
+可用 `MEDIA_DATA_DIR` 更换数据根目录。重启服务会把未完成任务重新排队；中断的上传需要重新提交。删除任务会删除该任务的本地文件。任务及模型不会自动上传到远程存储。
+
+请使用**单个 Uvicorn worker**，不要使用 `--workers 2` 或生产环境 `--reload`；后台并发通过 `TASK_WORKERS` 控制。任务目录包含服务进程锁，第二个进程不能重复执行相同目录中的任务。文件任务队列用于单机多人共享部署，不能让多台服务器同时调度同一个数据目录。任务显示名称修改后保持原目录稳定。原 UUID 目录会在首次升级启动时迁移，任务 ID 和旧链接保持有效。
+
+## Docker（可选）
+
+根目录已提供本地构建的 Dockerfile 与 Compose 配置，不再拉取原项目旧的云服务镜像：
+
+```bash
+cp variables_template.env variables.env
+# 填写模型配置后执行
+mkdir -p data
+docker compose up -d --build
+```
+
+访问 `http://localhost:8080`。`./data` 挂载到容器中，重建容器不会丢失任务与模型。首次转写可能需要下载 Whisper small。
+
+## 验证
+
+```bash
+uv pip install --python .venv/bin/python pytest
+PYTHONPATH=backend .venv/bin/python -m pytest tests -q
+npm --prefix frontend run build
+```
+
+测试覆盖字幕解析与时间轴、原生字幕优先、1080p/MP4 下载策略、清洗数字保护、任务持久化与取消、上传/访问鉴权、路径越界、图文 ZIP 解压后的图片引用，以及实际 FFmpeg 生成的 MP4 中英字幕轨。
+
+## 已知范围
+
+- 在线平台的反爬、登录、会员或地区限制不能由通用下载器保证绕过；当前网页不收集平台账号密码。如需登录态，可在服务器上自行准备 Netscape 格式 cookies 文件并通过 `YTDLP_COOKIES_FILE` 指定路径。
+- 多模态模型不可用时，会记录提示并退回清晰度选帧；没有合适画面时不硬插图。
+- 本次没有图片生成功能，不调用生图模型。
+- 最终生成物按功能仅提供 HTML、MD、PDF、中文 TXT、MP4；图文下载为仅含该报告及所用图片的 ZIP。内部 SRT、JSON 和检查点不作为下载文件展示。未实现 PPTX / DOCX 导出。
+
+## 参考
+
+- [yt-dlp 官方文档](https://github.com/yt-dlp/yt-dlp)
+- [faster-whisper 官方文档](https://github.com/SYSTRAN/faster-whisper)
+- [腾讯云 TokenHub 接口说明](https://cloud.tencent.com/document/product/1823/130079)
+
+原项目采用 MIT 许可证，保留原项目 LICENSE。
+
+## 模型接口格式
+
+在“模型设置”中，大语言模型和多模态模型分别选择 OpenAI 兼容（Chat Completions）或 Anthropic（Messages）。缺少一边配置时会从另一边补齐，已有独立配置保持各自的格式与模型。两者使用同一套报告、翻译和选图流程，效果主要取决于实际模型及其图片理解、上下文和输出能力。接口格式应与供应商实际提供的接口匹配。
+
+- OpenAI 兼容：`POST /v1/chat/completions`，Bearer API Key。
+- Anthropic：`POST /v1/messages`，`x-api-key` 和 `anthropic-version` 请求头，图片自动转换为 Messages 的 base64 内容块。
+
+地址可填写根地址、以 `/v1` 结尾的基础地址，或对应完整端点。现有腾讯云配置默认保留 OpenAI 兼容格式。暂未填写单独多模态模型信息时会复用文本模型配置；混用协议时请填写对应供应商的接口地址、模型名及密钥。

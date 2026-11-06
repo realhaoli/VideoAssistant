@@ -1,0 +1,87 @@
+"""OpenAI Chat Completions and Anthropic Messages transport adapters."""
+import base64
+import mimetypes
+
+import requests
+from openai import OpenAI, APIStatusError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+class ModelLimitError(ValueError):
+    def __init__(self, kind="output"):
+        self.kind = kind
+        super().__init__("模型输入或输出超过长度限制，已保留完成的分段，可继续处理")
+
+
+def context_error(value):
+    text = str(value).lower()
+    return any(term in text for term in ("context_length", "context window", "maximum context", "too many tokens", "prompt is too long", "input is too long", "context length", "上下文长度", "输入长度", "token limit", "max_tokens", "max_output_tokens"))
+
+
+def connection(config, visual=False):
+    prefix = "vlm" if visual else "llm"
+    return {
+        "format": config.get(prefix + "_api_format") or config.get("llm_api_format", "openai"),
+        "key": config.get(prefix + "_api_key") or config.get("llm_api_key", ""),
+        "url": config.get(prefix + "_base_url") or config.get("llm_base_url", ""),
+        "model": config.get(prefix + "_model") or config.get("llm_model", ""),
+    }
+
+
+def base_url(url, protocol):
+    value = url.rstrip("/")
+    ending = "/messages" if protocol == "anthropic" else "/chat/completions"
+    if value.endswith(ending):
+        value = value[:-len(ending)]
+    return value if value.endswith("/v1") else value + "/v1"
+
+
+def complete(config, prompt, system, visual, max_tokens, check):
+    selected = connection(config, bool(visual))
+    if not selected["key"] or not selected["model"] or not selected["url"]:
+        raise ValueError("请在模型设置中配置接口地址、模型名和 API Key")
+    check()
+    images = []
+    for path in visual or []:
+        images.append((mimetypes.guess_type(path.name)[0] or "image/jpeg", base64.b64encode(path.read_bytes()).decode()))
+    if selected["format"] == "anthropic":
+        content = [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}} for mime, data in images]
+        content.append({"type": "text", "text": prompt})
+        payload = {"model": selected["model"], "max_tokens": max_tokens, "system": system,
+                   "messages": [{"role": "user", "content": content if images else prompt}]}
+        with requests.Session() as session:
+            session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods={"POST"})))
+            response = session.post(base_url(selected["url"], "anthropic") + "/messages", json=payload,
+                                    headers={"x-api-key": selected["key"], "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, timeout=(15, 150))
+            if not response.ok:
+                if response.status_code in {400, 413, 422} and context_error(response.text):
+                    raise ModelLimitError("context")
+                raise ValueError(f"Anthropic 接口请求失败（HTTP {response.status_code}），请检查接口地址、模型名、密钥与额度")
+            body = response.json()
+        if body.get("stop_reason") in {"max_tokens", "model_context_window_exceeded"}:
+            raise ModelLimitError("output")
+        result = "\n".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text")
+    elif selected["format"] == "openai":
+        content = [{"type": "text", "text": prompt}]
+        content.extend({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}} for mime, data in images)
+        # HY supports temperature; omit it for reasoning models which may only
+        # accept their default sampling policy.
+        sampling = {"temperature": .15} if selected["model"].lower().startswith("hy-") else {}
+        with OpenAI(api_key=selected["key"], base_url=base_url(selected["url"], "openai"), timeout=150, max_retries=1) as client:
+            try:
+                response = client.chat.completions.create(model=selected["model"], messages=[{"role": "system", "content": system},
+                                                            {"role": "user", "content": content if images else prompt}], max_tokens=max_tokens, **sampling)
+            except APIStatusError as exc:
+                if exc.status_code == 413 or (exc.status_code in {400, 422} and context_error(exc)):
+                    raise ModelLimitError("context") from exc
+                raise
+        if response.choices[0].finish_reason == "length":
+            raise ModelLimitError("output")
+        result = response.choices[0].message.content
+    else:
+        raise ValueError("不支持的模型接口格式")
+    check()
+    if not result or not result.strip():
+        raise ValueError("模型返回空内容")
+    return result.strip()
