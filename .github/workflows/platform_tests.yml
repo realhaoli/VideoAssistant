@@ -61,8 +61,33 @@ jobs:
           npm --prefix frontend ci
           npm --prefix frontend run build
       - name: Install Chromium
-        run: python start-local.py --install-browser ${{ matrix.browser_flags }}
-      - name: Check launcher and run tests (including real FFmpeg and PDF exports)
+        run: '"$VENV_PYTHON" start-local.py --install-browser ${{ matrix.browser_flags }}'
+      - name: Check runtime dependencies
         run: |
-          python start-local.py --check
-          "$VENV_PYTHON" -m pytest -q
+          python - <<'PY'
+          import os, subprocess
+          result = subprocess.run([os.environ['VENV_PYTHON'], 'start-local.py', '--check'], capture_output=True, text=True, encoding='utf-8')
+          print(result.stdout, end='')
+          print(result.stderr, end='')
+          if result.returncode:
+              message = (result.stdout + result.stderr).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Runtime dependency check::' + message)
+          raise SystemExit(result.returncode)
+          PY
+      - name: Run tests (including real FFmpeg and PDF exports)
+        run: '"$VENV_PYTHON" -m pytest -q --junitxml="$RUNNER_TEMP/platform-tests.xml"'
+      - name: Report failing assertions
+        if: failure()
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          report = Path(os.environ['RUNNER_TEMP']) / 'platform-tests.xml'
+          if report.is_file():
+              for case in ET.parse(report).iter('testcase'):
+                  for failure in list(case.findall('failure')) + list(case.findall('error')):
+                      message = (case.get('name', '') + '\n' + (failure.text or ''))[:16000]
+                      message = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::error title=Platform test failure::' + message)
+          PY
