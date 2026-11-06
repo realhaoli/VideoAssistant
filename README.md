@@ -20,11 +20,23 @@
 
 ### 1. 环境要求
 
+支持目标为 **Windows、macOS、Linux**，统一使用 Python 启动入口。前端生成的是静态网页，可以在三个平台使用；Python 虚拟环境、`node_modules`、FFmpeg 与 Chromium 必须在目标平台重新安装，不能从 Mac 直接复制。
+
+| 平台 | 建议环境 |
+| --- | --- |
+| Windows | Windows 11 / Windows Server 2022，x64 Python；安装 Microsoft Visual C++ x64 运行库 |
+| macOS | macOS 14 或更新版本，Apple Silicon 或 Intel |
+| Linux | Ubuntu 22.04 / 24.04，或 Debian 12 / 13；安装 Chromium 系统依赖和中文字体 |
+
+依赖的支持范围见 [Playwright](https://playwright.dev/python/docs/intro#system-requirements) 和 [CTranslate2](https://opennmt.net/CTranslate2/installation)。Windows ARM64 原生 Python 不在当前预编译依赖的适配目标内。
+
 - Python **3.12**（建议使用这一版本）。
 - Node.js **22 或更新版本**，用于构建 Vue 前端。
 - **FFmpeg 与 ffprobe**，应能在终端直接执行。
 - 推荐安装 [uv](https://docs.astral.sh/uv/)。
 - Whisper small 多语言权重约 500 MB，首次准备时需要联网。CPU 模式也能运行，速度取决于视频时长和硬件。
+
+Windows 安装 [Python 3.12 x64](https://www.python.org/downloads/release/python-31210/)、[Node.js](https://nodejs.org/)、[FFmpeg（含 ffprobe）](https://ffmpeg.org/download.html) 和 [Visual C++ x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)。将 FFmpeg 的 `bin` 目录加入 `PATH`，重新打开终端，确认 `ffmpeg -version`、`ffprobe -version` 和 `node --version` 可执行。
 
 macOS 可通过 Homebrew 安装系统工具：
 
@@ -44,21 +56,31 @@ sudo apt install ffmpeg python3-venv fonts-noto-cjk
 
 在本项目根目录执行：
 
+Windows PowerShell：
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+.\.venv\Scripts\python.exe start-local.py --install-browser
+npm --prefix frontend ci
+npm --prefix frontend run build
+```
+
+macOS / Linux：
+
 ```bash
 cd "/你的项目目录"
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r backend/requirements.txt
-PLAYWRIGHT_BROWSERS_PATH=data/browser .venv/bin/python -m playwright install chromium --only-shell
-cd frontend
-npm install
-npm run build
-cd ..
+.venv/bin/python start-local.py --install-browser
+npm --prefix frontend ci
+npm --prefix frontend run build
 ```
 
 Linux 手动部署还需安装 Chromium 系统依赖：
 
 ```bash
-PLAYWRIGHT_BROWSERS_PATH=data/browser .venv/bin/python -m playwright install --with-deps chromium --only-shell
+.venv/bin/python start-local.py --install-browser --with-deps
 ```
 
 后台导图 PDF 与网页使用同一个本地渲染器，完整展开后自动保存，不要求用户保持网页打开；导出全局单路运行以控制内存。Chromium 只处理本地导图数据，渲染时阻止所有外部请求。
@@ -82,6 +104,14 @@ uv pip install --python .venv/bin/python \
 
 复制模板，编辑根目录的 `variables.env`：
 
+Windows PowerShell（仅首次配置）：
+
+```powershell
+if (!(Test-Path variables.env)) { Copy-Item variables_template.env variables.env }
+```
+
+macOS / Linux（仅首次配置）：
+
 ```bash
 cp variables_template.env variables.env
 chmod 600 variables.env
@@ -101,9 +131,13 @@ TASK_WORKERS=2
 
 可以在网页左下角的“模型设置”中分别设置大语言模型和多模态模型。每次打开都会读取服务器最新配置；只有一边有配置时，自动填到另一边，已存在的字段分别保留，缺失字段互相补齐。接口格式均明确选择 OpenAI 兼容或 Anthropic，不显示“沿用”选项。密钥在服务器端补齐，网页仅显示是否已配置，留空保存会保留已有密钥。共用模型时，该模型需要支持图片输入。也可以关闭多模态选图，退回清晰度与去重筛选。
 
-配置保存到本地 `data/settings.json`，密钥文件权限为仅当前用户可读写。API 不向网页返回密钥。网页保存的设置优先于环境变量。
+配置保存到本地 `data/settings.json`。macOS / Linux 的密钥文件权限为 `0600`；Windows 继承数据目录的 ACL，请将数据放在自己的用户目录中。API 不向网页返回密钥。网页保存的设置优先于环境变量。
+
+默认数据目录相对于项目根目录，不随终端工作目录改变。可在 `variables.env` 设置 `MEDIA_DATA_DIR`，例如 `MEDIA_DATA_DIR=D:/VideoAssistantData` 或 `MEDIA_DATA_DIR=workspace-data`。Windows 配置路径建议使用 `/`；路径可以包含空格和中文。Chromium 默认安装到该数据目录的 `browser/`，也可用 `PLAYWRIGHT_BROWSERS_PATH` 单独覆盖；变更路径后重新运行 `start-local.py --install-browser`。
 
 ### 4. 准备 Whisper small
+
+Windows 使用 `.\.venv\Scripts\python.exe scripts/prepare-whisper.py`；macOS / Linux 使用：
 
 ```bash
 .venv/bin/python scripts/prepare-whisper.py
@@ -128,9 +162,19 @@ WHISPER_DEVICE=auto
 
 前端构建后，在根目录执行：
 
+Windows（PowerShell 或 CMD）：
+
+```powershell
+.\start-local.cmd
+```
+
+macOS / Linux：
+
 ```bash
 ./start-local.sh
 ```
+
+也可以直接使用 `.venv` 中的 Python 执行 `start-local.py`；两个启动脚本都转交给同一入口，无需激活虚拟环境。入口支持 `--host`、`--port` 和 `--check`。例如 Windows 执行 `.\start-local.cmd --check`，macOS / Linux 执行 `./start-local.sh --check` 检查运行依赖。
 
 浏览器访问 **http://localhost:8080**。终端按 `Ctrl+C` 停止。也可以直接启动后端：
 
@@ -156,11 +200,15 @@ HOST=0.0.0.0 ./start-local.sh
 
 ### 开发模式
 
+Windows：`.\start-local.cmd --dev`。macOS / Linux：
+
 ```bash
 ./start-local.sh --dev
 ```
 
 前端 `http://localhost:5173`，后端 `http://localhost:8080`。日志位于 `logs/`。修改前端代码后，正式使用前重新执行 `npm --prefix frontend run build`。
+
+可以通过 `--port 8081 --frontend-port 5174` 更换端口，Vite 的 API 代理会随之后端端口调整。Windows 局域网访问还需允许 Python 使用相应入站端口。停止启动器时会清理它启动的服务进程。
 
 ## 使用
 
@@ -246,10 +294,14 @@ docker compose up -d --build
 ## 验证
 
 ```bash
-uv pip install --python .venv/bin/python pytest
-PYTHONPATH=backend .venv/bin/python -m pytest tests -q
+uv pip install --python .venv/bin/python -r backend/requirements-dev.txt
+.venv/bin/python -m pytest -q
 npm --prefix frontend run build
 ```
+
+Windows 将上述 `.venv/bin/python` 换为 `.\.venv\Scripts\python.exe`；如果没有 uv，使用 `.\.venv\Scripts\python.exe -m pip install -r backend/requirements-dev.txt` 安装测试依赖。不需要单独设置 `PYTHONPATH`。实际后台 PDF 测试需先安装浏览器并构建前端，然后设置 `RUN_PDF_RENDER_TEST=1`（PowerShell：`$env:RUN_PDF_RENDER_TEST='1'`；Bash：`RUN_PDF_RENDER_TEST=1 .venv/bin/python -m pytest -q`）。
+
+GitHub Actions 的 `Windows, macOS and Linux` 工作流在三个系统分别安装依赖、构建前端、运行测试，包括真实 FFmpeg 中英字幕封装和后台 Chromium PDF 生成。只有三项作业通过后，才表示该提交已通过跨平台 CI 验证。
 
 测试覆盖字幕解析与时间轴、原生字幕优先、1080p/MP4 下载策略、清洗数字保护、任务持久化与取消、上传/访问鉴权、路径越界、图文 ZIP 解压后的图片引用，以及实际 FFmpeg 生成的 MP4 中英字幕轨。
 

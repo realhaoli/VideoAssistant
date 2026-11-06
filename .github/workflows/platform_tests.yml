@@ -1,0 +1,68 @@
+name: Windows, macOS and Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: .venv/bin/python
+            browser_flags: --with-deps
+          - os: macos-14
+            python: .venv/bin/python
+            browser_flags: ''
+          - os: windows-2022
+            python: .venv/Scripts/python.exe
+            browser_flags: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      RUN_PDF_RENDER_TEST: '1'
+      VENV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: command -v ffmpeg || brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          "$VENV_PYTHON" -m pip install -r backend/requirements-dev.txt
+      - name: Build frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+      - name: Install Chromium
+        run: python start-local.py --install-browser ${{ matrix.browser_flags }}
+      - name: Check launcher and run tests (including real FFmpeg and PDF exports)
+        run: |
+          python start-local.py --check
+          "$VENV_PYTHON" -m pytest -q

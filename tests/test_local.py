@@ -51,7 +51,7 @@ def test_job_persistence_and_cancellation(tmp_path):
     jobs.cancel(task['id'])
     with pytest.raises(Cancelled):
         jobs.check(task['id'])
-    saved = json.loads((jobs.directory(task['id']) / 'task.json').read_text())
+    saved = json.loads((jobs.directory(task['id']) / 'task.json').read_text(encoding="utf-8"))
     assert saved['status'] == 'cancelled'
     assert jobs.retry(task['id'])['status'] == 'queued'
 
@@ -62,9 +62,9 @@ def test_portable_illustrated_zip_and_html(tmp_path):
     (output/'image').mkdir()
     for name in ['selected.jpg', 'unused.jpg', 'cover.jpg']:
         Image.new('RGB', (100,80), '#73926a').save(output/'image'/name)
-    (output/'text.md').write_text('不应打包其他报告')
+    (output/'text.md').write_text('不应打包其他报告', encoding="utf-8")
     (output/'video.mp4').write_bytes(b'not part of the report')
-    (output/'subtitles.zh.txt').write_text('不应打包字幕')
+    (output/'subtitles.zh.txt').write_text('不应打包字幕', encoding="utf-8")
     text = '# 中文汇报\n\n![封面](image/cover.jpg)\n\n## 参数说明\n\n![参数图](image/selected.jpg)\n\n续航 12 小时。'
     exports.report(output, 'illustrated', text)
     exports.bundle(output)
@@ -74,7 +74,7 @@ def test_portable_illustrated_zip_and_html(tmp_path):
         for relative in re.findall(r'!\[[^\]]*\]\(([^)]+)\)', archive.read('illustrated.md').decode()):
             assert relative in names
         archive.extractall(tmp_path/'unpacked')
-        portable = (tmp_path/'unpacked'/'illustrated.html').read_text()
+        portable = (tmp_path/'unpacked'/'illustrated.html').read_text(encoding="utf-8")
         assert 'src="image/selected.jpg"' in portable and 'src="image/cover.jpg"' in portable
         assert 'src="images/' not in portable
 
@@ -101,7 +101,7 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
             folder = jobs.directory(task['id'])
             assert (folder/'source.mp4').read_bytes() == b'media-data'
             (folder/'output').mkdir()
-            (folder/'output'/'report.txt').write_text('测试中文结果')
+            (folder/'output'/'report.txt').write_text('测试中文结果', encoding="utf-8")
             jobs.artifact(task['id'], 'report.txt', '汇报', 'text')
             result = await client.get(f"/api/v1/tasks/{task['id']}/files/report.txt")
             assert result.status_code == 200 and result.text == '测试中文结果'
@@ -116,7 +116,7 @@ def test_real_mp4_has_two_switchable_subtitle_tracks(tmp_path):
     media.command(['ffmpeg','-y','-v','error','-f','lavfi','-i','color=c=green:s=320x180:r=10','-f','lavfi','-i','sine=frequency=600:sample_rate=16000','-t','2','-c:v','libx264','-c:a','aac',str(video)])
     cues = [{'start':0,'end':1.5,'text':'中文测试字幕'}]
     zh, en = tmp_path/'zh.srt', tmp_path/'en.srt'
-    zh.write_text(subtitles.srt(cues)); en.write_text(subtitles.srt([dict(cues[0], text='English subtitle')]))
+    zh.write_text(subtitles.srt(cues), encoding="utf-8"); en.write_text(subtitles.srt([dict(cues[0], text='English subtitle')]), encoding="utf-8")
     result = tmp_path/'result.mp4'
     media.embed(video, zh, en, result, lambda: None)
     streams = media.probe(result)['streams']
@@ -143,7 +143,7 @@ def test_visual_caption_cannot_add_unsupported_numbers(tmp_path):
 
 def test_portable_html_does_not_load_model_generated_remote_images(tmp_path):
     exports.report(tmp_path, 'text', '# 汇报\n\n![未知图片](https://example.com/tracking.png)')
-    result = (tmp_path/'text.html').read_text()
+    result = (tmp_path/'text.html').read_text(encoding="utf-8")
     assert 'src="https://' not in result
 
 
@@ -153,14 +153,14 @@ def test_chinese_sidecar_skips_whisper_and_model_for_subtitles(tmp_path, monkeyp
     task = jobs.create(modes=['subtitles'],source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'},options={'clean_subtitles':False},title='已有中文字幕',enqueue=False)
     folder = jobs.directory(task['id'])
     (folder/'source.mp4').write_bytes(b'fixture')
-    (folder/'uploaded.srt').write_text('1\n00:00:00,000 --> 00:00:02,000\n已有的中文字幕。\n')
+    (folder/'uploaded.srt').write_text('1\n00:00:00,000 --> 00:00:02,000\n已有的中文字幕。\n', encoding="utf-8")
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':'2'},'streams':[{'codec_type':'video'}]})
     def forbidden(*args,**kwargs):
         raise AssertionError('Existing Chinese subtitles must not trigger ASR or LLM')
     monkeypatch.setattr(media,'transcribe',forbidden)
     monkeypatch.setattr(Intelligence,'chat',forbidden)
     pipeline.run(jobs,task['id'])
-    artifact = (folder/'subtitles.zh.srt').read_text()
+    artifact = (folder/'subtitles.zh.srt').read_text(encoding="utf-8")
     assert '已有的中文字幕' in artifact
     assert {p.name for p in (folder/'output').iterdir()} == {'subtitles.zh.txt'}
 
@@ -294,14 +294,14 @@ def test_english_sidecar_produces_downloadable_chinese_subtitles(tmp_path,monkey
     task=jobs.create(modes=['subtitles'],source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'},options={'clean_subtitles':True},title='英文字幕测试',enqueue=False)
     folder=jobs.directory(task['id'])
     (folder/'source.mp4').write_bytes(b'fixture')
-    (folder/'uploaded.srt').write_text('1\n00:00:01,000 --> 00:00:03,000\nWelcome to the presentation.\n')
+    (folder/'uploaded.srt').write_text('1\n00:00:01,000 --> 00:00:03,000\nWelcome to the presentation.\n', encoding="utf-8")
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':'3'},'streams':[{'codec_type':'video'}]})
     responses=iter([[{'id':0,'text':'欢迎参加本次汇报。'}],[{'id':0,'text':'欢迎参加本次汇报。'}]])
     monkeypatch.setattr(Intelligence,'chat',lambda *args,**kwargs:next(responses))
     pipeline.run(jobs,task['id'])
-    assert '欢迎参加本次汇报' in (folder/'subtitles.zh.srt').read_text()
-    assert '00:00:01,000 --> 00:00:03,000' in (folder/'subtitles.zh.srt').read_text()
-    assert 'Welcome to the presentation.' in (folder/'subtitles.original.srt').read_text()
+    assert '欢迎参加本次汇报' in (folder/'subtitles.zh.srt').read_text(encoding="utf-8")
+    assert '00:00:01,000 --> 00:00:03,000' in (folder/'subtitles.zh.srt').read_text(encoding="utf-8")
+    assert 'Welcome to the presentation.' in (folder/'subtitles.original.srt').read_text(encoding="utf-8")
     assert {a['name'] for a in jobs.get(task['id'])['artifacts']} == {'subtitles.zh.txt'}
 
 
@@ -309,16 +309,16 @@ def test_offline_mindmap_uses_original_renderer_and_escapes_data(tmp_path):
     plan = {'title': '技术 A < 5，</script><img src=x onerror=alert(1)>', 'chapters': [
         {'title': '技术参数', 'points': ['续航 12 小时', '容量 100 kWh']}]}
     exports.mindmap(tmp_path, plan)
-    page = (tmp_path / 'mindmap.html').read_text()
+    page = (tmp_path / 'mindmap.html').read_text(encoding="utf-8")
     assert 'MediaMindMap' in page and 'createMap' in page
     assert '下载 PDF' in page
     assert '<details' not in page
-    tree = json.loads((tmp_path / 'mindmap.json').read_text())
+    tree = json.loads((tmp_path / 'mindmap.json').read_text(encoding="utf-8"))
     tree['data']['text'] = '</script><img src=x onerror=alert(1)>'
     exports.mindmap_html(tmp_path, tree)
-    assert '\\u003c' in (tmp_path / 'mindmap.html').read_text()
+    assert '\\u003c' in (tmp_path / 'mindmap.html').read_text(encoding="utf-8")
     assert '<script src=' not in page
-    assert json.loads((tmp_path / 'mindmap.json').read_text())['children'][0]['data']['text'] == '技术参数'
+    assert json.loads((tmp_path / 'mindmap.json').read_text(encoding="utf-8"))['children'][0]['data']['text'] == '技术参数'
 
 
 def test_mindmap_pdf_is_the_only_public_map_file(tmp_path, monkeypatch):
@@ -329,7 +329,7 @@ def test_mindmap_pdf_is_the_only_public_map_file(tmp_path, monkeypatch):
     jobs.update(task['id'], status='completed')
     output = jobs.directory(task['id']) / 'output'
     output.mkdir()
-    (output.parent / 'mindmap.json').write_text('{}')
+    (output.parent / 'mindmap.json').write_text('{}', encoding="utf-8")
     monkeypatch.setattr(tasks, 'store', jobs)
     app = FastAPI()
     app.include_router(tasks.router)
@@ -360,7 +360,7 @@ def test_chapter_boundaries_use_real_cues(tmp_path):
 def test_model_markdown_wrapper_renders_as_paragraphs_and_table(tmp_path):
     body = '```markdown\n新闻报道正文。\n\n| 技术项目 | 数据 |\n| --- | --- |\n| 容量 | 100 kWh |\n```\n<｜hy_Assistant｜>'
     exports.report(tmp_path, 'text', body)
-    page = (tmp_path/'text.html').read_text()
+    page = (tmp_path/'text.html').read_text(encoding="utf-8")
     assert '<table>' in page and '<p>新闻报道正文。' in page
     assert '<pre>' not in page and 'hy_Assistant' not in page
 
@@ -373,7 +373,7 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
     task=jobs.create(modes=modes,source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'}, options={'clean_subtitles':False},title='技术测试',enqueue=False)
     folder=jobs.directory(task['id'])
     (folder/'source.mp4').write_bytes(b'fixture')
-    (folder/'uploaded.srt').write_text('1\n00:00:00,000 --> 00:00:05,000\n续航12小时，容量100kWh。\n')
+    (folder/'uploaded.srt').write_text('1\n00:00:00,000 --> 00:00:05,000\n续航12小时，容量100kWh。\n', encoding="utf-8")
     Image.new('RGB',(200,100),'white').save(folder/'cover.jpg')
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':'5'},'streams':[{'codec_type':'video'}]})
     monkeypatch.setattr(Intelligence,'plan',lambda *args:{'title':'电池系统','chapters':[{'title':'续航与容量','points':['续航12小时','容量100kWh'],'start':0,'end':5}]})
@@ -413,9 +413,9 @@ def test_previews_range_requests_and_report_package_access(tmp_path,monkeypatch)
     Image.new('RGB',(10,10),'white').save(out/'image/cover.jpg')
     exports.report(out,'illustrated','# 图文\n\n![封面](image/cover.jpg)')
     exports.report(out,'text','# 文字\n\n| 参数 | 数值 |\n| --- | --- |\n| 容量 | 100kWh |')
-    (out/'subtitles.zh.txt').write_text('中文字幕。')
+    (out/'subtitles.zh.txt').write_text('中文字幕。', encoding="utf-8")
     (out/'video.mp4').write_bytes(bytes(range(100)))
-    (out/'internal.json').write_text('不可下载')
+    (out/'internal.json').write_text('不可下载', encoding="utf-8")
     exports.bundle(out);exports.publish(jobs,task['id'])
     monkeypatch.setattr(tasks,'store',jobs);app=FastAPI();app.include_router(tasks.router)
     async def exercise():
@@ -476,8 +476,8 @@ def test_model_protocols_can_be_mixed_and_validated(tmp_path,monkeypatch):
 
 def test_report_comparison_symbols_and_unsupported_figures(tmp_path):
     exports.report(tmp_path,'text','# 技术报告\n\n目标<1秒，横向加速度>2G。')
-    assert '目标<1秒，横向加速度>2G。' in (tmp_path/'text.md').read_text()
-    assert '目标&lt;1秒，横向加速度&gt;2G。' in (tmp_path/'text.html').read_text()
+    assert '目标<1秒，横向加速度>2G。' in (tmp_path/'text.md').read_text(encoding="utf-8")
+    assert '目标&lt;1秒，横向加速度&gt;2G。' in (tmp_path/'text.html').read_text(encoding="utf-8")
 
 
 def test_model_json_with_trailing_text_or_second_object():
@@ -559,7 +559,7 @@ def test_task_rename_persists_and_survives_source_title_updates(tmp_path):
     assert renamed['title']==renamed['custom_title']=='新的汇报名称'
     jobs.update(task['id'],title='平台自动读取的标题',status='running')
     assert jobs.get(task['id'])['title']=='新的汇报名称'
-    assert json.loads((folder/'task.json').read_text())['custom_title']=='新的汇报名称'
+    assert json.loads((folder/'task.json').read_text(encoding="utf-8"))['custom_title']=='新的汇报名称'
     assert (folder/'source.mp4').read_bytes()==b'original'
     with pytest.raises(ValueError):jobs.rename(task['id'],'  ')
 

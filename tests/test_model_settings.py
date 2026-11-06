@@ -21,7 +21,7 @@ def isolated_settings(tmp_path, monkeypatch):
 @pytest.mark.parametrize('source,target', [('llm','vlm'), ('vlm','llm')])
 def test_single_model_configuration_fills_the_other_side(isolated_settings, source, target):
     values = {source+'_api_format':'anthropic', source+'_base_url':'https://models.example.test/v1', source+'_model':'vision-test',source+'_api_key':'fixture-secret'}
-    isolated_settings.write_text(json.dumps(values))
+    isolated_settings.write_text(json.dumps(values), encoding="utf-8")
     before = isolated_settings.read_bytes()
     filled = config.load()
     assert all(filled[target+'_'+name] == filled[source+'_'+name] for name in ('api_format','base_url','model','api_key'))
@@ -35,7 +35,7 @@ def test_single_model_configuration_fills_the_other_side(isolated_settings, sour
 def test_existing_independent_models_are_preserved(isolated_settings):
     values = {'llm_api_format':'openai', 'llm_base_url':'https://llm.example.test/v1','llm_model':'text-test','llm_api_key':'text-secret',
               'vlm_api_format':'anthropic','vlm_base_url':'https://vlm.example.test/v1','vlm_model':'vision-test','vlm_api_key':'vision-secret'}
-    isolated_settings.write_text(json.dumps(values))
+    isolated_settings.write_text(json.dumps(values), encoding="utf-8")
     loaded = config.load()
     assert all(loaded[key] == value for key,value in values.items())
     public = config.public()
@@ -43,13 +43,13 @@ def test_existing_independent_models_are_preserved(isolated_settings):
     assert public['vlm_key_mask'] == '*' * len('vision-secret')
     assert all(secret not in json.dumps(public) for secret in ('text-secret', 'vision-secret'))
     config.save({'llm_api_key':'','vlm_api_key':'','whisper_model':'base'})
-    saved = json.loads(isolated_settings.read_text())
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
     assert all(saved[key] == value for key,value in values.items())
 
 
 def test_partially_configured_model_keeps_its_own_nonempty_fields(isolated_settings):
     isolated_settings.write_text(json.dumps({'llm_api_format':'anthropic','llm_base_url':'https://models.example.test/v1','llm_model':'text-model','llm_api_key':'fixture-secret',
-                                            'vlm_api_format':'openai','vlm_model':'custom-vision'}))
+                                            'vlm_api_format':'openai','vlm_model':'custom-vision'}), encoding="utf-8")
     values = config.load()
     assert values['vlm_model'] == 'custom-vision' and values['vlm_api_format'] == 'openai'
     assert values['vlm_base_url'] == values['llm_base_url'] and values['vlm_api_key'] == values['llm_api_key']
@@ -71,7 +71,7 @@ def test_settings_api_accepts_vlm_only_and_persists_both_without_exposing_keys(i
             assert 'fixture-secret' not in response.text
             assert (await client.get('/api/v1/settings')).json()['llm_model'] == 'vision-test'
     asyncio.run(exercise())
-    saved = json.loads(isolated_settings.read_text())
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
     assert saved['llm_api_key'] == saved['vlm_api_key'] == 'fixture-secret'
 
 
@@ -100,6 +100,6 @@ def test_masked_settings_can_replace_a_key_and_keep_it_when_left_empty(isolated_
             assert retained.status_code == 200
             assert retained.json()['llm_key_mask'] == response.json()['llm_key_mask']
     asyncio.run(exercise())
-    saved = json.loads(isolated_settings.read_text())
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
     assert saved['llm_api_key'] == 'replacement-fixture-key'
     assert saved['vlm_api_key'] == 'original-fixture-key'

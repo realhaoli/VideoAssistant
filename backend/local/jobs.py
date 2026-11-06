@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from .config import JOBS, load, redact
-from .storage import atomic_json
+from .storage import atomic_json, open_shared_read
 
 MODES = {"illustrated", "text", "mindmap", "subtitles", "download"}
 ACTIVE = {"uploading", "queued", "running", "cancelling"}
@@ -63,6 +63,9 @@ class JobStore:
         value = "".join(c for c in str(title) if unicodedata.category(c) not in {"Cc", "Cf"})
         value = re.sub(r'[<>:"/\\|?*]', "_", value)
         value = re.sub(r"\s+", " ", value).strip(". ") or "未命名任务"
+        device = value.split(".", 1)[0].rstrip(" ").upper()
+        if device in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", device):
+            value = "_" + value
         while len(value.encode("utf-8")) > 160:
             value = value[:-1]
         return value
@@ -101,7 +104,7 @@ class JobStore:
             self.stopping.clear()
             for path in sorted(self.root.glob("*/task.json")):
                 try:
-                    job = json.loads(path.read_text())
+                    job = json.loads(path.read_text(encoding="utf-8"))
                     job_id = job["id"]
                     folder = path.parent
                     # Migrate old UUID-only directories once, before requests
@@ -176,7 +179,7 @@ class JobStore:
             path = self.directory(job_id) / "model-settings.json"
             if not path.exists():
                 atomic_json(path, load(), private=True)
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
 
     def source_title(self, job_id, title):
         with self.lock:
@@ -271,7 +274,7 @@ class JobStore:
             path = (folder / relative).resolve()
             if not path.is_relative_to(folder):
                 raise FileNotFoundError(relative)
-            stream = path.open("rb")
+            stream = open_shared_read(path)
             self.readers[job_id] = self.readers.get(job_id, 0) + 1
             return ResourceLease(self, job_id, stream)
 

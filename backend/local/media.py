@@ -99,7 +99,7 @@ def inspect_url(url, folder, check, warning):
                     parsed = subtitles.parse(text)
                     if parsed:
                         tracks[lang] = parsed
-                        (folder / f"platform.{lang}.srt").write_text(subtitles.srt(parsed))
+                        (folder / f"platform.{lang}.srt").write_text(subtitles.srt(parsed), encoding="utf-8")
                 except Exception as exc:
                     warning(f"{lang} 平台字幕读取失败，将使用其他字幕或本地转写：{type(exc).__name__}")
     metadata = {k: info.get(k) for k in ("title", "duration", "thumbnail", "webpage_url", "uploader")}
@@ -164,7 +164,7 @@ def embedded_subtitles(path, folder, check):
             continue
         target = folder / f"embedded.{lang}.srt"
         command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", f"0:{stream['index']}", str(target)], check)
-        parsed = subtitles.parse(target.read_text())
+        parsed = subtitles.parse(target.read_text(encoding="utf-8"))
         if parsed:
             tracks[lang] = parsed
     return tracks

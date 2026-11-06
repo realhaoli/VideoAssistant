@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parents[1] / 'variables.env')
+load_dotenv(Path(__file__).resolve().parents[1] / 'variables.env', encoding='utf-8-sig')
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -1,10 +1,9 @@
 import json
 import os
 import threading
-from pathlib import Path
+from .paths import ROOT, data_directory
 
-ROOT = Path(__file__).resolve().parents[2]
-DATA = Path(os.environ.get("MEDIA_DATA_DIR", ROOT / "data")).expanduser().resolve()
+DATA = data_directory()
 JOBS = DATA / "tasks"
 SETTINGS = DATA / "settings.json"
 LOCK = threading.RLock()
@@ -45,7 +44,7 @@ def load():
     }
     with LOCK:
         if SETTINGS.exists():
-            defaults.update(json.loads(SETTINGS.read_text()))
+            defaults.update(json.loads(SETTINGS.read_text(encoding="utf-8")))
     return fill_model_settings(defaults)
 
 

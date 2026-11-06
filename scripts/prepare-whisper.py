@@ -2,14 +2,16 @@
 from pathlib import Path
 import hashlib
 import json
-import os
+import sys
 import time
 import urllib.request
 from dotenv import load_dotenv
 
 root = Path(__file__).resolve().parents[1]
-load_dotenv(root / 'variables.env')
-folder = Path(os.getenv('MEDIA_DATA_DIR', root / 'data')).expanduser().resolve() / 'models' / 'faster-whisper-small'
+load_dotenv(root / 'variables.env', encoding='utf-8-sig')
+sys.path.insert(0, str(root / 'backend'))
+from local.paths import data_directory
+folder = data_directory() / 'models' / 'faster-whisper-small'
 folder.mkdir(parents=True, exist_ok=True)
 metadata = {'siblings': []}
 for attempt in range(3):

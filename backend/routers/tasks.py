@@ -297,7 +297,7 @@ def mindmap_source(job_id: str):
         path = job_directory(job_id) / "mindmap.json"
         if not path.is_file():
             raise HTTPException(409, "思维导图尚未生成")
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
 
 @secured.post("/tasks/{job_id}/mindmap/pdf")

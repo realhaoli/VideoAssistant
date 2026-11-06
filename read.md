@@ -4,7 +4,7 @@
 
 ## 前置环境
 
-安装 Python 3.12、Node.js 22+、FFmpeg（包含 ffprobe）和 uv。
+安装 Python 3.12、Node.js 22+、FFmpeg（包含 ffprobe）和 uv。本文以下命令用于 macOS / Linux；Windows 的完整安装、运行库要求和启动步骤见 [README.md](README.md#安装)。Windows 使用 `start-local.cmd`，三个系统都使用同一个 `start-local.py` 启动入口。
 
 macOS：
 
@@ -19,7 +19,7 @@ brew install python@3.12 node ffmpeg uv
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r backend/requirements.txt
-PLAYWRIGHT_BROWSERS_PATH=data/browser .venv/bin/python -m playwright install chromium --only-shell
+.venv/bin/python start-local.py --install-browser
 cd frontend
 npm ci
 npm run build

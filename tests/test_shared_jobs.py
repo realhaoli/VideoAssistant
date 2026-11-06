@@ -1,6 +1,7 @@
 """Regression checks for shared background jobs and bounded model stages."""
 import asyncio
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,7 +30,8 @@ def test_concurrent_same_name_jobs_keep_sources_settings_and_folders_separate(tm
     for job, folder in values:
         assert jobs.settings(job['id'])['llm_model'] == 'model-a'
         assert 'llm_api_key' not in json.dumps(job)
-        assert (folder/'model-settings.json').stat().st_mode & 0o777 == 0o600
+        if os.name != 'nt':  # Windows access control uses directory/file ACLs.
+            assert (folder/'model-settings.json').stat().st_mode & 0o777 == 0o600
         assert job['source']['number'] == job['options']['number']
 
 
@@ -45,7 +47,7 @@ def test_two_workers_finish_after_clients_close_and_duplicate_queue_is_ignored(t
             seen.append(job_id)
         barrier.wait(timeout=5)
         folder = store.directory(job_id)/'output'; folder.mkdir()
-        (folder/'text.md').write_text(store.get(job_id)['source']['url'])
+        (folder/'text.md').write_text(store.get(job_id)['source']['url'], encoding="utf-8")
         store.artifact(job_id, 'text.md', '文字汇报')
     monkeypatch.setattr(pipeline, 'run', run)
     async def submit():
@@ -61,7 +63,7 @@ def test_two_workers_finish_after_clients_close_and_duplicate_queue_is_ignored(t
         assert sorted(seen) == sorted(j['id'] for j in submitted)
         for job in submitted:
             assert jobs.get(job['id'])['status'] == 'completed'
-            assert (jobs.directory(job['id'])/'output/text.md').read_text() == job['source']['url']
+            assert (jobs.directory(job['id'])/'output/text.md').read_text(encoding="utf-8") == job['source']['url']
     finally:
         jobs.stop()
     restored = JobStore(tmp_path)
@@ -76,10 +78,10 @@ def test_two_workers_finish_after_clients_close_and_duplicate_queue_is_ignored(t
 def test_restart_resumes_queued_job_and_disallows_second_service(tmp_path, monkeypatch):
     jobs = JobStore(tmp_path)
     job = jobs.create(modes=['text'], source={}, options={}, title='恢复任务', enqueue=False)
-    (jobs.directory(job['id'])/'saved-checkpoint').write_text('done')
+    (jobs.directory(job['id'])/'saved-checkpoint').write_text('done', encoding="utf-8")
     jobs.update(job['id'], status='running')
     def resume(store, job_id):
-        assert (store.directory(job_id)/'saved-checkpoint').read_text() == 'done'
+        assert (store.directory(job_id)/'saved-checkpoint').read_text(encoding="utf-8") == 'done'
     monkeypatch.setattr(pipeline, 'run', resume)
     restored = JobStore(tmp_path)
     restored.start()
@@ -251,7 +253,7 @@ def test_real_background_pipeline_saves_pdf_with_no_browser_client(tmp_path, mon
         job = jobs.create(modes=['mindmap'], source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'}, options={'clean_subtitles':False}, title=title)
         folder = jobs.directory(job['id'])
         (folder/'source.mp4').write_bytes(b'fixture')
-        (folder/'uploaded.srt').write_text(f'1\n00:00:00,000 --> 00:00:05,000\n{title}电池容量100kWh。\n')
+        (folder/'uploaded.srt').write_text(f'1\n00:00:00,000 --> 00:00:05,000\n{title}电池容量100kWh。\n', encoding="utf-8")
         submitted.append(job)
     jobs.start()
     try:
@@ -341,7 +343,7 @@ def test_preview_returns_404_when_another_client_deletes_before_open(tmp_path, m
     job = jobs.create(modes=['text'], source={}, options={}, enqueue=False)
     jobs.update(job['id'], status='completed')
     output = jobs.directory(job['id'])/'output'; output.mkdir()
-    (output/'text.md').write_text('中文报告')
+    (output/'text.md').write_text('中文报告', encoding="utf-8")
     jobs.artifact(job['id'], 'text.md', '文字汇报')
     monkeypatch.setattr(tasks, 'store', jobs)
     original = jobs.open_resource

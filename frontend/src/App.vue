@@ -64,6 +64,9 @@ const canSubmit = computed(
     !submitting.value,
 );
 const progressText = (message = "") => message.replace(/Whisper\s+(?:large-v3-turbo|large-v3|medium|small|base|tiny)\s+(?=转写|本地转写)/g, "Whisper ");
+const stageProgressText = computed(() =>
+  progressText(activeTask.value?.message || "等待处理").replace(/[\s，,]*(\d+(?:\.\d+)?)%$/, "，$1%"),
+);
 const statusName = (state) =>
   ({
     queued: "等待处理",
@@ -642,8 +645,8 @@ onBeforeUnmount(() => clearInterval(timer));
         </div>
         <section class="progress-card">
           <div>
-            <strong>{{ progressText(activeTask.message) }}</strong
-            ><span>{{ activeTask.progress.toFixed(0) }}%</span>
+            <strong>当前阶段：{{ stageProgressText }}</strong
+            ><span class="total-progress">总进度：{{ activeTask.progress.toFixed(0) }}%</span>
           </div>
           <el-progress
             :percentage="activeTask.progress"

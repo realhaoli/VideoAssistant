@@ -681,13 +681,22 @@ input[type="checkbox"] {
 }
 .progress-card > div:first-child {
   display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
   justify-content: space-between;
   gap: 20px;
+  row-gap: 6px;
   margin-bottom: 15px;
   font-size: 14px;
 }
 .progress-card strong {
+  flex: 1;
+  min-width: 160px;
   font-weight: 400;
+}
+.total-progress {
+  margin-left: auto;
+  white-space: nowrap;
 }
 .task-controls {
   display: flex;

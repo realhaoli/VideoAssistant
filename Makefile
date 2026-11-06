@@ -15,7 +15,7 @@ help:
 run:
 	docker compose up -d
 
-	@echo "🚀 项目已启动，访问地址：http://127.0.0.1:5173/";
+	@echo "🚀 项目已启动，访问地址：http://127.0.0.1:8080/";
 	@echo "💤 停止运行：make stop";
 
 .PHONY: stop

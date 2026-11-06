@@ -62,7 +62,7 @@ class Intelligence:
         digest = hashlib.sha256(json.dumps([label, self.config, material], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         path = self.checkpoint_dir / (label + "-" + digest + ".json")
         if path.exists():
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         result = generate()
         atomic_json(path, result)
         return result
@@ -133,7 +133,7 @@ class Intelligence:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists():
                     try:
-                        mapping = {int(key): value for key, value in json.loads(path.read_text()).items()}
+                        mapping = {int(key): value for key, value in json.loads(path.read_text(encoding="utf-8")).items()}
                     except (ValueError, TypeError, AttributeError):
                         mapping = {}
 
@@ -257,7 +257,7 @@ class Intelligence:
 
     def plan(self, segments, duration, options, metadata, checkpoint):
         if checkpoint.exists():
-            return json.loads(checkpoint.read_text())
+            return json.loads(checkpoint.read_text(encoding="utf-8"))
         batches = self.bounded_segments(segments, 4800)
         if len(batches) == 1:
             try:
@@ -297,7 +297,7 @@ class Intelligence:
 
     def _plan_small(self, segments, duration, options, metadata, checkpoint):
         if checkpoint.exists():
-            return json.loads(checkpoint.read_text())
+            return json.loads(checkpoint.read_text(encoding="utf-8"))
         indexed = "\n".join(f"[{i}] {s['start']:.1f}s {s['text']}" for i, s in enumerate(segments))
         notes = [indexed]
         maximum = max(1, min(4, math.ceil((segments[-1]["end"] - segments[0]["start"]) / 240)))

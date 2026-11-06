@@ -11,7 +11,7 @@ from .storage import atomic_bytes, atomic_json, atomic_text
 
 def cached(path, generate):
     if path.exists():
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     value = generate()
     atomic_json(path, value)
     return value
@@ -38,10 +38,10 @@ def run(store, job_id):
     if source["type"] == "url":
         metadata_path = folder / "source_info.json"
         if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text())
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             for lang in ("zh", "en"):
                 if (folder / f"platform.{lang}.srt").exists():
-                    tracks[lang] = subtitles.parse((folder / f"platform.{lang}.srt").read_text())
+                    tracks[lang] = subtitles.parse((folder / f"platform.{lang}.srt").read_text(encoding="utf-8"))
         else:
             metadata, tracks = media.inspect_url(source["url"], folder, check, warn)
         title = metadata.get("title") or job["title"]
@@ -96,7 +96,7 @@ def run(store, job_id):
             segments, lang = media.transcribe(media_path, folder, check,
                                                lambda p: progress("transcribe", 24 + p * .2, f"Whisper 转写 {p}%"), settings=intelligence.config, warning=warn)
             runtime_path = folder / "whisper-runtime.json"
-            runtime = json.loads(runtime_path.read_text()) if runtime_path.exists() else {}
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.exists() else {}
             return {"segments": segments, "language": lang, "model": model_name, "device": runtime.get("device", "cpu")}
         speech_data = cached(folder / "whisper.json", speech)
         lang = speech_data["language"]
@@ -109,7 +109,7 @@ def run(store, job_id):
     if not raw:
         raise ValueError("字幕为空，无法继续处理")
     metadata["duration"] = max(float(metadata.get("duration") or 0), max(s["end"] for s in raw))
-    (folder / "subtitles.original.srt").write_text(subtitles.srt(raw))
+    (folder / "subtitles.original.srt").write_text(subtitles.srt(raw), encoding="utf-8")
     store.update(job_id, transcript_source=transcript_source, duration=metadata["duration"])
     progress("transcript", 45, f"已取得字幕：{transcript_source}")
     zh = tracks.get("zh")
@@ -121,7 +121,7 @@ def run(store, job_id):
         zh = cached(folder / "cleaned.zh.json", lambda: intelligence.transform(zh, clean=True, progress=lambda p: progress("clean", 49 + p * 6, f"字幕清洗 {round(p * 100)}%")))
     if not zh:
         raise ValueError("字幕仅含语气词，没有可生成汇报的有效内容；原始字幕已保留")
-    (folder / "subtitles.zh.srt").write_text(subtitles.srt(zh))
+    (folder / "subtitles.zh.srt").write_text(subtitles.srt(zh), encoding="utf-8")
     if "subtitles" in modes:
         text = "\n\n".join(f"[{subtitles.stamp(s['start'])} --> {subtitles.stamp(s['end'])}]\n{s['text']}" for s in zh)
         exports.write_text(output / "subtitles.zh.txt", text)
@@ -131,7 +131,7 @@ def run(store, job_id):
         progress("chapters", 60, "按完整内容组织中文汇报章节")
         plan = intelligence.plan(zh, metadata["duration"], options, metadata, folder / f"plan-{VERSION}.json")
         store.update(job_id, report_title=plan["title"])
-        (folder / "chapters.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+        (folder / "chapters.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         if modes & {"illustrated", "text", "mindmap"}:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             parts, illustrated_parts, used = [], [], []
@@ -142,7 +142,7 @@ def run(store, job_id):
                 draft_path = folder / f"draft-{VERSION}-{index}.md"
                 def draft():
                     if draft_path.exists():
-                        return draft_path.read_text()
+                        return draft_path.read_text(encoding="utf-8")
                     body = intelligence.draft(chapter, zh, options)
                     body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
                     atomic_text(draft_path, body)
@@ -204,7 +204,7 @@ def run(store, job_id):
                 # Put the illustration after the opening explanation, inside its chapter.
                 opening, separator, remainder = body.partition("\n\n")
                 illustrated_parts.append(heading + opening + figure + (separator + remainder if separator else ""))
-            (folder / "image-selections.json").write_text(json.dumps(selections, ensure_ascii=False, indent=2))
+            (folder / "image-selections.json").write_text(json.dumps(selections, ensure_ascii=False, indent=2), encoding="utf-8")
             if "mindmap" in modes:
                 outline = exports.report_outline(plan, [results[i][1] for i in range(len(chapters))])
                 exports.mindmap_data(folder / "mindmap.json", outline)
@@ -237,7 +237,7 @@ def run(store, job_id):
         en = tracks.get("en")
         if en is None:
             en = cached(folder / "translated.en.json", lambda: intelligence.transform(zh, language="en"))
-        (folder / "subtitles.en.srt").write_text(subtitles.srt(en))
+        (folder / "subtitles.en.srt").write_text(subtitles.srt(en), encoding="utf-8")
         final_video = output / "video.mp4"
         if not final_video.exists():
             progress("embed", 94, "封装 MP4 视频与可切换中英字幕轨")
@@ -250,5 +250,5 @@ def run(store, job_id):
     provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
                   "transcript_source": transcript_source, "language": "zh-CN", "whisper_model": store.get(job_id).get("whisper_model"),
                   "warnings": store.get(job_id)["warnings"]}
-    (folder / "source.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2))
+    (folder / "source.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
     exports.publish(store, job_id)

@@ -138,7 +138,7 @@ def mindmap(output, plan):
     tree = node(plan["title"], [node(c["title"], [node(p) for p in c.get("points", [])[:8]]) for c in plan["chapters"]])
     content = json.dumps(tree, ensure_ascii=False, indent=2)
     target = output / "mindmap.json"
-    if target.exists() and target.read_text() != content:
+    if target.exists() and target.read_text(encoding="utf-8") != content:
         (output / "mindmap.pdf").unlink(missing_ok=True)
     write_text(target, content)
 
@@ -147,7 +147,7 @@ def mindmap(output, plan):
     for ch in plan["chapters"]:
         lines.append("\n## " + ch["title"])
         lines.extend("- " + str(p) for p in ch.get("points", []))
-    (output / "mindmap.md").write_text("\n".join(lines))
+    (output / "mindmap.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def mindmap_html(output, tree):
@@ -156,7 +156,7 @@ def mindmap_html(output, tree):
         raise RuntimeError("缺少思维导图渲染文件，请在 frontend 执行 npm run build")
     # Both data and bundled JS are inline, so the HTML works offline. Escape
     # script terminators even when generated text contains hostile markup.
-    script = re.sub(r"</script", r"<\\/script", runtime.read_text(), flags=re.I)
+    script = re.sub(r"</script", r"<\\/script", runtime.read_text(encoding="utf-8"), flags=re.I)
     data = json.dumps(tree, ensure_ascii=False).replace("<", "\\u003c")
     title = html.escape(tree["data"]["text"])
     content = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -188,7 +188,7 @@ def bundle(output, illustrated_only=True):
         if not all(p.is_file() for p in documents):
             raise ValueError("图文汇报尚未生成完整")
         referenced = set()
-        for relative in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", documents[0].read_text()):
+        for relative in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", documents[0].read_text(encoding="utf-8")):
             path = (output / relative).resolve()
             if not relative.startswith("image/") or not path.is_relative_to((output / "image").resolve()) or not path.is_file():
                 raise ValueError(f"图文汇报图片路径无效：{relative}")
@@ -237,7 +237,7 @@ def mindmap_data(path, plan):
     tree = node(plan["title"], [node(c["title"], [node(p) for p in c.get("points", [])[:8]]) for c in plan["chapters"]])
     content = json.dumps(tree, ensure_ascii=False, indent=2)
     pdf = path.parent / "output" / "mindmap.pdf"
-    if path.exists() and path.read_text() != content:
+    if path.exists() and path.read_text(encoding="utf-8") != content:
         pdf.unlink(missing_ok=True)
     write_text(path, content)
 
@@ -256,7 +256,7 @@ def normalize_outputs(folder, modes):
     if "subtitles" in modes and not (output / "subtitles.zh.txt").exists() and (output / "transcript.zh.txt").is_file():
         shutil.copy2(output / "transcript.zh.txt", output / "subtitles.zh.txt")
     if "illustrated" in modes and (output / "illustrated.md").is_file():
-        content = (output / "illustrated.md").read_text()
+        content = (output / "illustrated.md").read_text(encoding="utf-8")
         def migrate_image(match):
             relative = match[2]
             source = (output / relative).resolve()

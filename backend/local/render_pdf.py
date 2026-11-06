@@ -2,7 +2,6 @@
 import asyncio
 import base64
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -10,7 +9,9 @@ from pathlib import Path
 async def render(source, target):
     from playwright.async_api import async_playwright
     root = Path(__file__).resolve().parents[2]
-    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(root / 'data' / 'browser'))
+    sys.path.insert(0, str(root / 'backend'))
+    from local.paths import configure_browser_path
+    configure_browser_path()
     runtime = root / 'frontend' / 'dist' / 'mindmap-renderer.js'
     if not runtime.is_file():
         raise RuntimeError('缺少导图渲染文件，请执行 npm --prefix frontend run build')
