@@ -18,7 +18,7 @@ jobs:
           - os: ubuntu-24.04
             python: .venv/bin/python
             browser_flags: --with-deps
-          - os: macos-14
+          - os: macos-latest
             python: .venv/bin/python
             browser_flags: ''
           - os: windows-2022
