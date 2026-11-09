@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart>=0.0.18
+openai==1.88.0
+requests>=2.31.0
+python-json-logger==2.0.7
+python-dotenv>=1.0.0
+yt-dlp[default]>=2025.1.1
+faster-whisper>=1.1.0,<2
+# PyAV 16+ changes av.open keyword arguments used by faster-whisper 1.x
+av>=11,<16
+Pillow>=10.0.0
+Markdown>=3.6
+playwright>=1.56,<2

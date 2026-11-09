@@ -1,0 +1,110 @@
+name: Windows, macOS and Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: .venv/bin/python
+            browser_flags: --with-deps
+          - os: macos-latest
+            python: .venv/bin/python
+            browser_flags: ''
+          - os: windows-2022
+            python: .venv/Scripts/python.exe
+            browser_flags: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      RUN_PDF_RENDER_TEST: '1'
+      VENV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: command -v ffmpeg || brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg installation failed' }
+          # Chocolatey may report an already installed package without creating
+          # shims in the shell used by later steps. Export the actual binary dir.
+          $binary = Get-ChildItem "$env:ChocolateyInstall/lib/ffmpeg*" -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.DirectoryName 'ffprobe.exe') } |
+            Select-Object -First 1
+          if ($binary) {
+            $binary.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            & $binary.FullName -version
+          } else {
+            $command = Get-Command ffmpeg -ErrorAction Stop
+            Split-Path $command.Source | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            ffmpeg -version
+            ffprobe -version
+          }
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          "$VENV_PYTHON" -m pip install -r backend/requirements-dev.txt
+      - name: Build frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+      - name: Install Chromium
+        run: '"$VENV_PYTHON" start-local.py --install-browser ${{ matrix.browser_flags }}'
+      - name: Check runtime dependencies
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          result = subprocess.run([os.environ['VENV_PYTHON'], 'start-local.py', '--check'], capture_output=True, text=True, encoding='utf-8')
+          print(result.stdout, end='')
+          print(result.stderr, end='')
+          if result.returncode:
+              message = (result.stdout + result.stderr).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Runtime dependency check::' + message)
+          raise SystemExit(result.returncode)
+          PY
+      - name: Run tests (including real FFmpeg and PDF exports)
+        run: '"$VENV_PYTHON" -m pytest -q --junitxml="$RUNNER_TEMP/platform-tests.xml"'
+      - name: Report failing assertions
+        if: failure()
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          report = Path(os.environ['RUNNER_TEMP']) / 'platform-tests.xml'
+          if report.is_file():
+              for case in ET.parse(report).iter('testcase'):
+                  for failure in list(case.findall('failure')) + list(case.findall('error')):
+                      message = (case.get('name', '') + '\n' + (failure.text or ''))[:16000]
+                      message = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::error title=Platform test failure::' + message)
+          PY

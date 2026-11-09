@@ -1,0 +1,22 @@
+{
+  "name": "video-assistant-frontend",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/build-mindmap.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "element-plus": "^2.9.7",
+    "simple-mind-map": "^0.13.1-fix.2",
+    "vue": "^3.5.13",
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.2.0"
+  }
+}
