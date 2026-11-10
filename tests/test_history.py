@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import json
 from pathlib import Path
 
@@ -93,8 +94,71 @@ def test_folder_migration_failure_cannot_hide_readable_history(tmp_path, monkeyp
         assert restored.get(task['id'])['title'] == '旧任务名称'
         assert restored.directory(task['id']) == legacy
         assert restored.history_status()['unreadable_tasks'] == 0
+        assert not (tmp_path/'旧任务名称').exists()
     finally:
         restored.stop()
+
+
+def test_url_job_retries_in_place_when_source_title_rename_is_denied(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path)
+    task = jobs.create(modes=['subtitles'], source={'type':'url', 'url':'https://example.test/replay'},
+                       options={}, title='example.test', enqueue=False)
+    job_id = task['id']
+    folder = jobs.directory(job_id)
+    title = '发布会回放'
+    (folder/'source_info.json').write_text(json.dumps({'title':title, 'duration':5}), encoding='utf-8')
+    (folder/'platform.zh.srt').write_text('1\n00:00:00,000 --> 00:00:05,000\n发布会字幕\n', encoding='utf-8')
+    partial = folder/'source.mp4.part'
+    partial.write_bytes(b'existing partial download')
+    jobs.update(job_id, status='failed', error='previous rename failed')
+    rename = Path.rename
+    attempts = []
+
+    def deny_rename(path, target):
+        if path == folder:
+            attempts.append(target)
+            raise PermissionError(errno.EACCES, 'Access is denied', str(path), 5, str(target))
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, 'rename', deny_rename)
+    jobs.start()
+    try:
+        jobs.retry(job_id)
+        jobs.queue.join()
+        assert jobs.get(job_id)['status'] == 'completed'
+        assert jobs.directory(job_id) == folder
+        assert '发布会字幕' in (folder/'output/subtitles.zh.txt').read_text(encoding='utf-8')
+        assert partial.read_bytes() == b'existing partial download'
+        assert attempts == [tmp_path/title]
+        assert not (tmp_path/title).exists()
+        for filename in ('task.json', 'task.backup.json'):
+            record = json.loads((folder/filename).read_text(encoding='utf-8'))
+            assert record['title'] == title and record['storage_folder'] == folder.name
+            assert record['source_title_resolved'] is True
+    finally:
+        jobs.stop()
+
+    restored = JobStore(tmp_path)
+    restored.start()
+    try:
+        assert restored.get(job_id)['status'] == 'completed'
+        assert restored.directory(job_id) == folder
+        assert restored.history_status()['unreadable_tasks'] == 0
+        assert restored.source_title(job_id, title) == folder
+        assert len(attempts) == 1
+    finally:
+        restored.stop()
+
+
+def test_source_title_rename_keeps_existing_same_name_task(tmp_path):
+    jobs = JobStore(tmp_path)
+    existing = jobs.create(modes=['text'], source={}, options={}, title='发布会', enqueue=False)
+    task = jobs.create(modes=['text'], source={'type':'url'}, options={}, title='example.test', enqueue=False)
+    original = jobs.directory(task['id'])
+    folder = jobs.source_title(task['id'], '发布会')
+    assert folder == tmp_path/'发布会 (2)' and not original.exists()
+    assert jobs.directory(existing['id']) == tmp_path/'发布会'
+    assert json.loads((folder/'task.json').read_text(encoding='utf-8'))['storage_folder'] == folder.name
 
 
 def test_utf8_bom_record_remains_visible(tmp_path):

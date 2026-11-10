@@ -1,6 +1,7 @@
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import errno
+from itertools import count
 import json
 import logging
 import math
@@ -89,16 +90,37 @@ class JobStore:
             value = value[:-1]
         return value
 
-    def _new_folder(self, title):
+    def _folder_candidates(self, title):
         base = self.folder_name(title)
-        number = 1
-        while True:
-            path = self.root / (base if number == 1 else f"{base} ({number})")
+        for number in count(1):
+            yield self.root / (base if number == 1 else f"{base} ({number})")
+
+    def _new_folder(self, title):
+        for path in self._folder_candidates(title):
             try:
                 path.mkdir(parents=True, exist_ok=False)
                 return path
             except FileExistsError:
-                number += 1
+                continue
+
+    def _rename_folder_if_possible(self, folder, title):
+        """Try a display-friendly directory name while holding the store lock."""
+        try:
+            for target in self._folder_candidates(title):
+                if target == folder:
+                    return folder
+                try:
+                    target.lstat()
+                except FileNotFoundError:
+                    # Choose an unused name without creating an empty task
+                    # directory that would be left behind if the move fails.
+                    folder.rename(target)
+                    return target
+        except OSError as exc:
+            if not folder.is_dir():
+                raise
+            LOGGER.warning("任务目录改名失败，继续使用原目录 %s：%s", folder, exc)
+            return folder
 
     def _claim_service(self):
         self.owner = (self.root / ".service.lock").open("a+")
@@ -145,14 +167,7 @@ class JobStore:
                     # Migrate old UUID-only directories once, before requests
                     # or workers start. Public IDs and URLs remain unchanged.
                     if folder.name == job_id:
-                        try:
-                            target = self._new_folder(job["title"])
-                            target.rmdir()
-                            folder.rename(target)
-                            folder = target
-                        except OSError:
-                            # A cosmetic folder migration must not hide history.
-                            LOGGER.warning("保留原任务目录，无法重命名：%s", folder)
+                        folder = self._rename_folder_if_possible(folder, job["title"])
                     self.jobs[job_id], self.paths[job_id] = job, folder
                     self.readers[job_id] = 0
                     job["storage_folder"] = folder.name
@@ -295,13 +310,10 @@ class JobStore:
             # Resolve URL titles before downloading or publishing results. A
             # directory with published resources is never moved under readers.
             if not job.get("source_title_resolved") and not job["artifacts"] and not self.readers.get(job_id):
-                if self.folder_name(title) != folder.name:
-                    target = self._new_folder(title)
-                    target.rmdir(); folder.rename(target)
-                    self.paths[job_id] = target
-                    job["storage_folder"] = target.name
-            self.update(job_id, title=title, source_title_resolved=True)
-            return self.directory(job_id)
+                folder = self._rename_folder_if_possible(folder, title)
+                self.paths[job_id] = folder
+            self.update(job_id, title=title, source_title_resolved=True, storage_folder=folder.name)
+            return folder
 
     def get(self, job_id):
         with self.lock:
