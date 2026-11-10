@@ -409,15 +409,16 @@ def _chunk_steps(path, folder, check, progress, settings, warning, phase, durati
             def extract_audio():
                 temporary = work / 'audio.partial.wav'
                 try:
-                    if phase:
-                        phase('audio', None)
                     with reserve_disk(work, int((window_end - window_start) * 32000) + 4096):
                         ffmpeg_command(['ffmpeg', '-y', '-v', 'error', '-ss', str(window_start), '-i', str(path),
-                                        '-t', str(window_end-window_start), '-vn', '-ac', '1', '-ar', '16000', str(temporary)], check)
+                                        '-t', str(window_end-window_start), '-vn', '-ac', '1', '-ar', '16000', str(temporary)], check,
+                                       duration=window_end-window_start, progress=(lambda p: phase('audio', p)) if phase else None)
                         temporary.replace(audio)
                 finally:
                     temporary.unlink(missing_ok=True)
             if not audio.is_file():
+                if phase:
+                    phase('audio', None)
                 yield Step('media', extract_audio)
             if phase:
                 phase('waiting', None)
@@ -552,8 +553,8 @@ def image_hash(path):
     return sum((values[y * 17 + x] > values[y * 17 + x + 1]) << (y * 16 + x) for y in range(16) for x in range(16))
 
 
-def candidates(path, chapter, output, index, used, check):
-    from concurrent.futures import ThreadPoolExecutor
+def candidates(path, chapter, output, index, used, check, *, progress=None):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     start, end = chapter["start"], chapter["end"]
     duration = max(.1, end - start)
     def extract(item):
@@ -573,9 +574,15 @@ def candidates(path, chapter, output, index, used, check):
             return dict(path=target, time=timestamp, quality=quality, hash=fingerprint, duplicate=duplicate)
         except (RuntimeError, ValueError):
             return None
+    samples = (.04, .17, .30, .43, .56, .69, .82, .94)
+    images = [None] * len(samples)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        images = [image for image in pool.map(extract, enumerate((.04, .17, .30, .43, .56, .69, .82, .94))) if image]
-    ranked = sorted(images, key=lambda item: (not item["duplicate"], item["quality"]), reverse=True)
+        futures = {pool.submit(extract, (n, fraction)): n for n, fraction in enumerate(samples)}
+        for completed, future in enumerate(as_completed(futures), 1):
+            images[futures[future]] = future.result()
+            if progress:
+                progress(completed * 100 / len(samples))
+    ranked = sorted((image for image in images if image), key=lambda item: (not item["duplicate"], item["quality"]), reverse=True)
     diverse = []
     for image in ranked:
         if image["quality"] > .4 and not any((image["hash"] ^ old["hash"]).bit_count() < 12 for old in diverse):

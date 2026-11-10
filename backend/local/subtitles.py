@@ -2,6 +2,26 @@ import html
 import json
 import re
 
+from opencc import OpenCC
+
+
+_TO_SIMPLIFIED = OpenCC("t2s.json")
+_FILLER_SEPARATOR = re.compile(r"[\s，,。.!！?？；;…、~—-]+")
+_FILLER_WORD = re.compile(r"(?:[嗯啊呃额額哦噢唉诶誒欸]+|uh+|um+|erm+|er+|hmm+|mm+)")
+
+
+def simplified(text):
+    return _TO_SIMPLIFIED.convert(text)
+
+
+def filler_only(text):
+    words = [word for word in _FILLER_SEPARATOR.split(text.lower()) if word]
+    return bool(words) and all(_FILLER_WORD.fullmatch(word) for word in words)
+
+
+def clean_transcript(segments):
+    return [cue for cue in segments if not filler_only(cue["text"])]
+
 
 def seconds(text):
     parts = text.strip().replace(",", ".").split(":")

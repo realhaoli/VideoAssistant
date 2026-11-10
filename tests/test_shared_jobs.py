@@ -347,7 +347,7 @@ def test_report_with_video_download_reuses_video_for_transcription(tmp_path, mon
     def transform(*args, **kwargs):
         pytest.fail('Chinese ASR with cleaning disabled must bypass subtitle model calls')
     monkeypatch.setattr(Intelligence, 'transform', transform)
-    monkeypatch.setattr(pdf_export, 'render', lambda folder, check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
+    monkeypatch.setattr(pdf_export, 'render', lambda folder, check, **kwargs:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     def export_video(source, target, details, check, **kwargs):
         assert source.suffix == '.mp4' and source.parent.name == 'original'
         kwargs['progress'](50)

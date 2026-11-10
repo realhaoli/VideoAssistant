@@ -5,7 +5,7 @@ import re
 import threading
 
 from . import subtitles
-from .model_client import ModelLimitError, connection
+from .model_client import ModelLimitError, ModelTimeoutError, connection
 from .storage import atomic_json, atomic_text, fingerprint, read_checkpoint
 from .limits import budget, request_budget
 from .resources import MODELS
@@ -174,6 +174,8 @@ class Intelligence:
         else:
             instruction += "每条都需要非空文本；语气词也应返回对应译文，不能用空字符串或省略条目代替翻译。"
         recovered = kept = removed = 0
+        smaller_batch = None
+        local_cleanup = False
         for n, batch in enumerate(batches):
             self.check()
             path = None
@@ -200,14 +202,29 @@ class Intelligence:
                 return [cue for cue in batch if not self._valid_subtitle(mapping.get(cue["id"]), cue, language, clean)]
 
             pending = missing()
-            if pending:
+            start = 0
+            while start < len(pending) and not local_cleanup:
+                group = pending[start:start + smaller_batch] if smaller_batch else pending[start:]
                 try:
-                    values = self.subtitle_request(pending, instruction, language, clean)
+                    values = self.subtitle_request(group, instruction, language, clean)
+                except ModelTimeoutError:
+                    if clean and not language:
+                        local_cleanup = True
+                        self.warning('模型清洗超时，余下字幕使用本地语气词清理，保留原句和时间轴')
+                        break
+                    if not language or smaller_batch is not None or len(group) < 2:
+                        raise
+                    smaller_batch = max(1, len(group) // 2)
+                    self.warning(f'字幕翻译超时，后续按每批最多 {smaller_batch} 条继续')
+                    continue
                 except ModelLimitError:
                     raise
                 except ValueError:
                     values = []
-                mapping.update(self._subtitle_mapping(values, {cue["id"] for cue in pending}))
+                mapping.update(self._subtitle_mapping(values, {cue["id"] for cue in group}))
+                if smaller_batch is not None:
+                    persist()
+                start += len(group)
 
             pending = missing()
             # Repair only bad IDs in small groups. Already-valid translations
@@ -235,7 +252,7 @@ class Intelligence:
                 value = mapping.get(cue["id"])
                 repaired = False
                 if not self._valid_subtitle(value, cue, language, clean):
-                    if language and self._filler_only(cue["text"]):
+                    if language and subtitles.filler_only(cue["text"]):
                         value = "嗯。" if language == "zh" else "Um."
                     elif language:
                         value = self.translate_cue(cue["text"], instruction)
@@ -252,11 +269,12 @@ class Intelligence:
                             raise ValueError(f"第 {cue['id'] + 1} 条字幕未取得有效译文，已保留原稿和已完成的翻译，请继续处理")
                         recovered += 1
                         repaired = True
-                    elif clean and self._filler_only(cue["text"]):
+                    elif clean and subtitles.filler_only(cue["text"]):
                         value = ""
                     else:
                         value = cue["text"]
-                        kept += 1
+                        if not local_cleanup:
+                            kept += 1
                 if clean and not language and re.findall(r"\d+(?:[.,]\d+)*", value) != re.findall(r"\d+(?:[.,]\d+)*", cue["text"]):
                     value = cue["text"]
                 mapping[cue["id"]] = value.strip()
@@ -277,16 +295,11 @@ class Intelligence:
         return result
 
     @staticmethod
-    def _filler_only(text):
-        text = re.sub(r"[\s，,。.!！?？；;…、~—-]", "", text).lower()
-        return bool(text) and re.fullmatch(r"(?:嗯+|啊+|呃+|额+|哦+|噢+|唉+|诶+|欸+|uh+|um+|erm+|er+|hmm+|mm+)+", text) is not None
-
-    @classmethod
-    def _valid_subtitle(cls, value, cue, language, clean):
+    def _valid_subtitle(value, cue, language, clean):
         if not isinstance(value, str):
             return False
         if not value.strip():
-            return bool(clean and not language and cls._filler_only(cue["text"]))
+            return bool(clean and not language and subtitles.filler_only(cue["text"]))
         if language == "zh" and value.strip() == cue["text"].strip():
             foreign = re.findall(r"[\u0400-\u052f\u0590-\u0e7f\u3041-\u30fa\uac00-\ud7a3]", value)
             if any(character.isalpha() for character in foreign):

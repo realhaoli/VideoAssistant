@@ -315,7 +315,9 @@ def test_large_mindmap_is_split_into_complete_pdf_pages(tmp_path):
         {'data':{'text':f'第{i+1}章技术结论'},'children':[{'data':{'text':'关键规格与技术机制'}}]} for i in range(13)]}
     atomic_json(tmp_path/'mindmap.json',tree)
     (tmp_path/'output').mkdir()
-    pdf_export.render(tmp_path,lambda:None)
+    progress = []
+    pdf_export.render(tmp_path, lambda:None, progress=progress.append)
+    assert progress[-1] == 100 and any(0 < value < 100 for value in progress)
     root=Path(__file__).resolve().parents[1]
     result=subprocess.run(['node','--input-type=module','-e',
         "import fs from 'node:fs'; import {PDFDocument} from 'pdf-lib'; const pdf=await PDFDocument.load(fs.readFileSync(process.argv[1])); process.stdout.write(String(pdf.getPageCount()));",

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-async def render(source, target):
+async def render(source, target, progress_file=None):
     from playwright.async_api import async_playwright
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / 'backend'))
@@ -25,10 +25,13 @@ async def render(source, target):
             # requests, including links a generated node might contain.
             await context.route('**/*', lambda route: route.abort())
             page = await context.new_page()
+            if progress_file is not None:
+                await page.expose_function('videoAssistantPdfProgress',
+                                           lambda done, total: progress_file.write_text(f'{done}/{total}', encoding='ascii'))
             await page.set_content('<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>')
             await page.add_script_tag(path=str(runtime))
             encoded = await page.evaluate('''async tree => {
-                const blob = await window.MediaMindMap.renderPdf(tree);
+                const blob = await window.MediaMindMap.renderPdf(tree, window.videoAssistantPdfProgress);
                 return await new Promise((resolve, reject) => {
                     const reader = new FileReader();
                     reader.onload = () => resolve(reader.result.split(',')[1]);
@@ -43,4 +46,5 @@ async def render(source, target):
 
 if __name__ == '__main__':
     timeout = max(60, min(600, int(os.getenv('PDF_TIMEOUT_SECONDS', '300'))))
-    asyncio.run(asyncio.wait_for(render(Path(sys.argv[1]), Path(sys.argv[2])), timeout=timeout))
+    progress_file = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    asyncio.run(asyncio.wait_for(render(Path(sys.argv[1]), Path(sys.argv[2]), progress_file), timeout=timeout))

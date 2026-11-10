@@ -33,8 +33,10 @@ const file = ref(null), url = ref("");
 const fileInput = ref(null),
   dragging = ref(false),
   submitting = ref(false),
-  uploadPercent = ref(0);
+  uploadPercent = ref(null);
 const checkingLink = ref(false);
+const submitStartedAt = ref(0);
+const nowSeconds = ref(Date.now() / 1000);
 const linkChoice = ref(null);
 const selectedResource = ref(null);
 const tasks = ref([]),
@@ -66,21 +68,35 @@ const canSubmit = computed(
     !submitting.value && !linkChoice.value,
 );
 const progressText = (message = "") => message.replace(/Whisper\s+(?:large-v3-turbo|large-v3|medium|small|base|tiny)\s+(?=转写|本地转写)/g, "Whisper ");
+function elapsedSince(start) {
+  const seconds = Math.max(0, Math.floor(nowSeconds.value - start));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  return `${hours ? `${hours}小时` : ""}${hours || minutes ? `${minutes}分` : ""}${seconds % 60}秒`;
+}
+const submissionProgressText = computed(() => {
+  const elapsed = ` · 已运行 ${elapsedSince(submitStartedAt.value)}`;
+  if (checkingLink.value) return `正在检查链接中的音视频资源${elapsed}`;
+  if (sourceTab.value === "upload") return `正在上传素材${uploadPercent.value === null ? elapsed : ` ${uploadPercent.value}%`}`;
+  return `正在提交任务${elapsed}`;
+});
+function stageLabel(state, fallbackStart) {
+  const message = progressText(state?.message || "等待处理");
+  const value = state?.stage_progress;
+  const known = Number.isFinite(value);
+  const label = known ? `${message.replace(/[\s，,]*\d+(?:\.\d+)?%$/, "")}，${Math.round(value)}%` : message;
+  const startedAt = state?.stage_started_at || fallbackStart;
+  if (!["running", "queued", "uploading", "cancelling"].includes(state?.status) || !Number.isFinite(startedAt)) return label;
+  if (known && (value >= 100 || (value > 0 && nowSeconds.value - startedAt < 10))) return label;
+  return `${label} · 已${state.status === "queued" ? "等待" : "运行"} ${elapsedSince(startedAt)}`;
+}
 const stageProgressText = computed(() => {
   const task = activeTask.value;
   const running = Object.values(task?.output_states || {}).filter(output => output.status === 'running');
-  const stages = [...new Set(running.map(output => output.message).filter(Boolean))];
+  const distinct = new Map(running.map(output => [JSON.stringify([output.stage, output.message, output.stage_progress]), output]));
+  const stages = [...distinct.values()].map(output => stageLabel(output, task.stage_started_at || task.updated_at));
   if (stages.length > 1) return '并行处理：' + stages.join(' / ');
-  if (running.length && stages.length === 1) {
-    const value = running[0].stage_progress;
-    return progressText(stages[0]).replace(/[\s，,]*\d+(?:\.\d+)?%$/, '') + (typeof value === 'number' ? `，${Math.round(value)}%` : '');
-  }
-  const message = progressText(task?.message || "等待处理");
-  if (typeof task?.stage_progress === "number" && Number.isFinite(task.stage_progress)) {
-    const label = message.replace(/[\s，,]*\d+(?:\.\d+)?%$/, "");
-    return `${label}，${Math.round(task.stage_progress)}%`;
-  }
-  return message.replace(/[\s，,]*(\d+(?:\.\d+)?)%$/, "，$1%");
+  return stages[0] || stageLabel(task, task?.events?.at(-1)?.time || task?.created_at);
 });
 const statusName = (state) =>
   ({
@@ -215,7 +231,7 @@ function clearTaskForm() {
   sourceTab.value = "url";
   dragging.value = false;
   if (fileInput.value) fileInput.value.value = "";
-  if (!submitting.value) uploadPercent.value = 0;
+  if (!submitting.value) uploadPercent.value = null;
 }
 function newTask() {
   clearTaskForm();
@@ -293,6 +309,7 @@ async function taskSubmitted(task) {
 async function confirmResource() {
   if (!linkChoice.value || !selectedResource.value || submitting.value) return;
   submitting.value = true;
+  submitStartedAt.value = Date.now() / 1000;
   try {
     const task = await createLinkTask(linkChoice.value.payload, selectedResource.value);
     linkChoice.value = null;
@@ -311,7 +328,8 @@ function resourceDuration(seconds) {
 async function submit() {
   if (!canSubmit.value) return;
   submitting.value = true;
-  uploadPercent.value = 0;
+  uploadPercent.value = null;
+  submitStartedAt.value = Date.now() / 1000;
   const options = {};
   try {
     let task;
@@ -323,6 +341,7 @@ async function submit() {
         body: JSON.stringify({ url: payload.url }),
       });
       checkingLink.value = false;
+      submitStartedAt.value = Date.now() / 1000;
       if (view.value !== "new" || url.value.trim() !== payload.url) return;
       if (resources.length > 1 || truncated) {
         selectedResource.value = null;
@@ -448,8 +467,9 @@ async function saveModels(test = false) {
     modelBusy.value = false;
   }
 }
-let timer;
+let timer, elapsedTimer;
 onMounted(async () => {
+  elapsedTimer = setInterval(() => { nowSeconds.value = Date.now() / 1000; }, 1000);
   await Promise.all([refresh(), loadSettings()]);
   let idleTicks = 0;
   timer = setInterval(() => {
@@ -458,7 +478,10 @@ onMounted(async () => {
     if (activeCount.value || idleTicks % 4 === 0) refresh();
   }, 2500);
 });
-onBeforeUnmount(() => clearInterval(timer));
+onBeforeUnmount(() => {
+  clearInterval(timer);
+  clearInterval(elapsedTimer);
+});
 </script>
 
 <template>
@@ -650,9 +673,9 @@ onBeforeUnmount(() => clearInterval(timer));
           </div>
           <p class="timing-note">耗时为参考预估，不含排队；实际随设备、字幕、网速和模型速度变化。</p>
           <div v-if="submitting" class="upload-progress" role="status">
-            <span>{{ checkingLink ? "正在检查链接中的音视频资源…" : sourceTab === "upload" ? `正在上传素材 ${uploadPercent}%` : "正在提交任务…" }}</span>
+            <span>{{ submissionProgressText }}</span>
             <el-progress
-              v-if="sourceTab === 'upload'"
+              v-if="sourceTab === 'upload' && uploadPercent !== null"
               :percentage="uploadPercent"
               :show-text="false"
               color="#409eff"
@@ -784,7 +807,7 @@ onBeforeUnmount(() => clearInterval(timer));
           <div v-if="activeTask.output_states" class="output-progress-list">
             <div v-for="feature in features.filter(item => activeTask.modes.includes(item.id))" :key="feature.id" class="output-progress-item">
               <div><strong>{{ feature.name }}</strong><span class="status-badge" :class="activeTask.output_states[feature.id]?.status">{{ statusName(activeTask.output_states[feature.id]?.status || 'pending') }}</span><small>产物进度：{{ activeTask.output_states[feature.id]?.progress || 0 }}%</small></div>
-              <p>{{ progressText(activeTask.output_states[feature.id]?.message || '等待处理') }}<span v-if="activeTask.output_states[feature.id]?.error"> · {{ activeTask.output_states[feature.id].error }}</span></p>
+              <p>{{ stageLabel(activeTask.output_states[feature.id], activeTask.stage_started_at || activeTask.updated_at) }}<span v-if="activeTask.output_states[feature.id]?.error"> · {{ activeTask.output_states[feature.id].error }}</span></p>
             </div>
           </div>
           <p v-if="activeTask.error" class="error-text">

@@ -5,9 +5,12 @@ import os
 import re
 
 import requests
-from openai import OpenAI, APIStatusError
+from openai import APITimeoutError, APIStatusError, OpenAI, Timeout
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import ReadTimeoutError
 from urllib3.util.retry import Retry
+
+from .resources import setting
 
 
 class ModelLimitError(ValueError):
@@ -15,6 +18,11 @@ class ModelLimitError(ValueError):
         self.kind = kind
         self.maximum = maximum
         super().__init__("模型输入或输出超过长度限制，已保留完成的分段，可继续处理")
+
+
+class ModelTimeoutError(TimeoutError):
+    def __init__(self):
+        super().__init__("等待模型接口响应超时，已完成的检查点可在继续处理时复用")
 
 
 def context_error(value):
@@ -80,6 +88,7 @@ def complete(config, prompt, system, visual, max_tokens, check):
     maximum_bytes = int(os.getenv("MODEL_REQUEST_MB", "16")) * 1024**2
     if len((prompt + system).encode('utf-8')) + sum(len(data) for _, data in images) + 4096 > maximum_bytes:
         raise ModelLimitError("payload")
+    timeout = setting('MODEL_TIMEOUT_SECONDS', 150, low=15, high=600)
     if selected["format"] == "anthropic":
         content = [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}} for mime, data in images]
         content.append({"type": "text", "text": prompt})
@@ -87,8 +96,17 @@ def complete(config, prompt, system, visual, max_tokens, check):
                    "messages": [{"role": "user", "content": content if images else prompt}]}
         with requests.Session() as session:
             session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods={"POST"})))
-            response = session.post(base_url(selected["url"], "anthropic") + "/messages", json=payload,
-                                    headers={"x-api-key": selected["key"], "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, timeout=(15, 150))
+            try:
+                response = session.post(base_url(selected["url"], "anthropic") + "/messages", json=payload,
+                    headers={"x-api-key": selected["key"], "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                    timeout=(15, timeout))
+            except requests.exceptions.Timeout as exc:
+                raise ModelTimeoutError() from exc
+            except requests.exceptions.ConnectionError as exc:
+                reason = exc.args[0] if exc.args else None
+                if isinstance(getattr(reason, 'reason', reason), ReadTimeoutError):
+                    raise ModelTimeoutError() from exc
+                raise
             if not response.ok:
                 error = limit_error(response.text, response.status_code)
                 if error:
@@ -104,10 +122,13 @@ def complete(config, prompt, system, visual, max_tokens, check):
         # HY supports temperature; omit it for reasoning models which may only
         # accept their default sampling policy.
         sampling = {"temperature": .15} if selected["model"].lower().startswith("hy-") else {}
-        with OpenAI(api_key=selected["key"], base_url=base_url(selected["url"], "openai"), timeout=150, max_retries=1) as client:
+        with OpenAI(api_key=selected["key"], base_url=base_url(selected["url"], "openai"),
+                    timeout=Timeout(timeout, connect=15), max_retries=1) as client:
             try:
                 response = client.chat.completions.create(model=selected["model"], messages=[{"role": "system", "content": system},
                                                             {"role": "user", "content": content if images else prompt}], max_tokens=max_tokens, **sampling)
+            except APITimeoutError as exc:
+                raise ModelTimeoutError() from exc
             except APIStatusError as exc:
                 error = limit_error(str(exc), exc.status_code)
                 if error:

@@ -21,11 +21,13 @@ class OutputProgress:
         def progress(stage, percent, message, stage_percent=None):
             with self.lock:
                 start, span = (60,33) if branch == 'report' else (93,5)
-                self.values[branch] = max(self.values[branch], min(.99, max(0,(percent-start)/span)))
+                fraction = min(.99, max(0, (percent-start)/span))
+                self.values[branch] = max(self.values[branch], fraction)
                 states = self.store.get(self.job_id).get('output_states',{})
                 for mode in selected:
                     if states.get(mode,{}).get('status') not in {'completed','failed'}:
-                        self.store.update_output(self.job_id, mode, status='running', progress=round(self.values[branch]*100),
+                        previous = states.get(mode, {}).get('progress', 0)
+                        self.store.update_output(self.job_id, mode, status='running', stage=stage, progress=max(previous, round(fraction * 100)),
                                                  message=message, stage_progress=stage_percent)
                 self.store.progress(self.job_id, stage, self.total(), message, stage_progress=stage_percent)
         return progress

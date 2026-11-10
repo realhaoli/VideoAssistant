@@ -7,6 +7,7 @@ import pytest
 
 from local import media
 from local.jobs import Cancelled, JobStore
+from local.output_progress import OutputProgress
 
 
 def test_stage_progress_is_independent_and_unknown_stage_clears_it(tmp_path):
@@ -23,6 +24,28 @@ def test_stage_progress_is_independent_and_unknown_stage_clears_it(tmp_path):
     assert jobs.get(job['id'])['stage_progress'] is None
     jobs.retry(job['id'])
     assert jobs.get(job['id'])['progress'] == 0 and jobs.get(job['id'])['stage_progress'] is None
+
+
+def test_parallel_stages_keep_independent_start_times_and_progress(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path)
+    job = jobs.create(modes=['text', 'mindmap'], source={}, options={}, enqueue=False)
+    now = 100.0
+    monkeypatch.setattr('local.jobs.time.time', lambda: now)
+    tracker = OutputProgress(jobs, job['id'], job['modes'])
+    report = tracker.for_branch('report', {'text'})
+    pdf = tracker.for_branch('report', {'mindmap'})
+    report('overview', 89, '等待模型摘要')
+    now = 110
+    pdf('mindmap', 92, '生成导图', 50)
+    now = 115
+    report('overview', 89, '继续等待模型摘要')
+    states = jobs.get(job['id'])['output_states']
+    assert states['text']['stage_started_at'] == 100 and states['text']['stage_progress'] is None
+    assert states['mindmap']['stage_started_at'] == 110 and states['mindmap']['stage_progress'] == 50
+    assert states['text']['progress'] < states['mindmap']['progress']
+    now = 120
+    report('write_report', 92, '写入报告')
+    assert jobs.get(job['id'])['output_states']['text']['stage_started_at'] == 120
 
 
 @pytest.mark.parametrize('failure', [False, True], ids=['success', 'cancelled'])

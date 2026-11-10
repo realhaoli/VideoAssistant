@@ -59,7 +59,7 @@ export async function waitForMap(map) {
   await document.fonts.ready;
 }
 
-export async function renderPdf(data) {
+export async function renderPdf(data, onPage) {
   const tree = typeof data === "string" ? JSON.parse(data) : data;
   const count = node => 1 + (node.children || []).reduce((sum, child) => sum + count(child), 0);
   if ((tree.children?.length > 12 || count(tree) > 150) && tree.children?.length > 1) {
@@ -68,6 +68,7 @@ export async function renderPdf(data) {
       const part = { ...tree, data: { ...tree.data, text: `${tree.data.text}（${i + 1}/${tree.children.length}）` }, children: [tree.children[i]] };
       const document = await PDFDocument.load(await (await renderPdf(part)).arrayBuffer());
       for (const page of await merged.copyPages(document, document.getPageIndices())) merged.addPage(page);
+      await onPage?.(i + 1, tree.children.length);
     }
     return new Blob([await merged.save()], { type: "application/pdf" });
   }

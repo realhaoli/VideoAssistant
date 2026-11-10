@@ -47,8 +47,8 @@ def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
     monkeypatch.setattr(Intelligence,'draft',draft)
     monkeypatch.setattr(Intelligence,'overview',lambda *args:{'one_sentence':'电池容量100kWh。','key_conclusions':[],'data_terms':[]})
     monkeypatch.setattr(Intelligence,'transform',lambda self,segments,**kwargs:segments)
-    monkeypatch.setattr(media,'candidates',lambda *args:[])
-    monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
+    monkeypatch.setattr(media,'candidates',lambda *args, **kwargs:[])
+    monkeypatch.setattr(pdf_export,'render',lambda folder,check,**kwargs:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     def export_video(source,target,details,check,**kwargs):
         calls.append('export_video');kwargs['progress'](50);target.write_bytes(b'finished video')
     monkeypatch.setattr(media,'export_video',export_video)
@@ -76,16 +76,18 @@ def test_all_output_combinations_complete_without_unselected_outputs(tmp_path, m
 
 @pytest.mark.parametrize('track, asr_language, expected', [
     ('zh', None, []), ('en', None, ['zh']), ('original', None, ['zh']),
-    (None, 'zh', ['clean']), (None, 'en', ['clean', 'zh']),
+    (None, 'zh', []), (None, 'en', ['zh']),
 ])
 @pytest.mark.parametrize('with_document', [False, True])
 def test_video_and_documents_share_the_same_chinese_subtitles(tmp_path, monkeypatch, track, asr_language, expected, with_document):
+    monkeypatch.delenv('ASR_CLEANUP_MODE', raising=False)
     modes = ['download', 'subtitles', 'text'] if with_document else ['download']
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, modes)
     jobs.update(task['id'], options={'clean_subtitles': True})
     cues = [{'start': 0, 'end': 1, 'text': '字幕样本'}]
     monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {track: cues} if track else {})
-    monkeypatch.setattr(media, 'transcribe', lambda *args, **kwargs: (cues, asr_language) if asr_language else pytest.fail('existing subtitles should bypass ASR'))
+    spoken = [*cues, {'start': 1, 'end': 2, 'text': 'Um.' if asr_language == 'en' else '嗯。'}]
+    monkeypatch.setattr(media, 'transcribe', lambda *args, **kwargs: (spoken, asr_language) if asr_language else pytest.fail('existing subtitles should bypass ASR'))
     calls = []
 
     def transform(engine, segments, *, language=None, clean=False, **kwargs):
@@ -106,12 +108,14 @@ def test_video_and_documents_share_the_same_chinese_subtitles(tmp_path, monkeypa
     assert (folder / 'output/video.mp4').is_file()
     video_text = (folder / 'subtitles.zh.srt').read_text(encoding='utf-8').splitlines()[2]
     assert video_text == ' '.join(['字幕样本', *expected])
+    if asr_language:
+        assert '00:00:02,000' not in (folder / 'subtitles.zh.srt').read_text(encoding='utf-8')
     english = folder / 'output/subtitles.en.txt'
     if with_document:
         assert report_cues == [{**cues[0], 'text': video_text}]
         assert video_text in (folder / 'output/subtitles.zh.txt').read_text(encoding='utf-8')
     if with_document and (track or asr_language) == 'en':
-        assert english.read_text(encoding='utf-8').splitlines()[1] == ('字幕样本 clean' if asr_language else '字幕样本')
+        assert english.read_text(encoding='utf-8').splitlines()[1] == '字幕样本'
         assert {a['name'] for a in jobs.get(task['id'])['artifacts']} >= {'subtitles.en.txt', 'subtitles.zh.txt'}
     else:
         assert not english.exists()
@@ -135,7 +139,7 @@ def test_existing_subtitles_allow_video_when_report_generation_fails(tmp_path, m
 
 def test_pdf_failure_preserves_other_outputs_and_retry_only_rebuilds_pdf(tmp_path,monkeypatch):
     jobs,task,folder,downloads,calls = prepare(tmp_path,monkeypatch,MODES)
-    def fail(*args):raise RuntimeError('PDF renderer failed')
+    def fail(*args, **kwargs):raise RuntimeError('PDF renderer failed')
     monkeypatch.setattr(pdf_export,'render',fail)
     with pytest.raises(OutputFailure) as error:
         pipeline.run(jobs,task['id'])
@@ -143,7 +147,7 @@ def test_pdf_failure_preserves_other_outputs_and_retry_only_rebuilds_pdf(tmp_pat
     assert (folder/'output/video.mp4').is_file() and (folder/'output/text.html').is_file()
     assert jobs.get(task['id'])['output_states']['mindmap']['status']=='failed'
     before = list(calls)
-    monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
+    monkeypatch.setattr(pdf_export,'render',lambda folder,check,**kwargs:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     pipeline.run(jobs,task['id'])
     assert calls == before
     assert jobs.get(task['id'])['output_states']['mindmap']['status']=='completed'
@@ -152,19 +156,50 @@ def test_pdf_failure_preserves_other_outputs_and_retry_only_rebuilds_pdf(tmp_pat
 def test_frame_failure_does_not_block_text_or_pdf(tmp_path, monkeypatch):
     jobs, task, folder, _, calls = prepare(tmp_path, monkeypatch, ['illustrated', 'text', 'mindmap'])
 
-    def broken_frames(*args):
-        assert (folder / 'output/text.html').is_file()
+    def broken_frames(*args, **kwargs):
         raise OSError('frame decoding failed')
 
     monkeypatch.setattr(media, 'candidates', broken_frames)
     with pytest.raises(OutputFailure) as failure:
         pipeline.run(jobs, task['id'])
     assert set(failure.value.errors) == {'illustrated'}
+    assert (folder / 'output/text.html').is_file()
     assert (folder / 'output/mindmap.pdf').is_file()
-    monkeypatch.setattr(media, 'candidates', lambda *args: [])
+    monkeypatch.setattr(media, 'candidates', lambda *args, **kwargs: [])
     pipeline.run(jobs, task['id'])
     assert calls.count('draft') == 1
     assert (folder / 'output/illustrated.zip').is_file()
+
+
+def test_pdf_is_published_and_frames_start_while_report_summary_is_waiting(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated', 'text', 'mindmap'])
+    summary_started, frames_started, release = threading.Event(), threading.Event(), threading.Event()
+    overview = Intelligence.overview
+
+    def slow_overview(*args):
+        summary_started.set()
+        assert release.wait(8)
+        return overview(*args)
+
+    def sample_frames(*args, **kwargs):
+        frames_started.set()
+        return []
+
+    monkeypatch.setattr(Intelligence, 'overview', slow_overview)
+    monkeypatch.setattr(media, 'candidates', sample_frames)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(pipeline.run, jobs, task['id'])
+        try:
+            assert summary_started.wait(3) and frames_started.wait(3)
+            deadline = time.monotonic() + 3
+            while jobs.get(task['id'])['output_states']['mindmap']['status'] != 'completed':
+                assert time.monotonic() < deadline
+                time.sleep(.01)
+            assert any(a['name'] == 'mindmap.pdf' and not a.get('pending') for a in jobs.get(task['id'])['artifacts'])
+            assert not (folder / 'output/text.html').exists()
+        finally:
+            release.set()
+        pending.result(timeout=5)
 
 
 def test_existing_subtitles_let_report_finish_while_shared_video_downloads(tmp_path, monkeypatch):
@@ -195,6 +230,7 @@ def test_existing_subtitles_let_report_finish_while_shared_video_downloads(tmp_p
 
 
 def test_retry_with_current_model_rebuilds_unfinished_model_stages(tmp_path, monkeypatch):
+    monkeypatch.setenv('ASR_CLEANUP_MODE', 'model')
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text'], native=False)
     jobs.update(task['id'], options={'clean_subtitles': True})
     snapshot = folder / 'model-settings.json'
@@ -251,13 +287,13 @@ def test_video_is_published_while_report_is_still_waiting(tmp_path,monkeypatch):
 
 def test_worker_marks_partial_then_successful_retry(tmp_path,monkeypatch):
     jobs,task,folder,*_ = prepare(tmp_path,monkeypatch,MODES)
-    monkeypatch.setattr(pdf_export,'render',lambda *args:(_ for _ in ()).throw(RuntimeError('PDF failed')))
+    monkeypatch.setattr(pdf_export,'render',lambda *args, **kwargs:(_ for _ in ()).throw(RuntimeError('PDF failed')))
     jobs.update(task['id'],status='queued')
     jobs.start()
     try:
         jobs.queue.join()
         assert jobs.get(task['id'])['status']=='partial'
-        monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
+        monkeypatch.setattr(pdf_export,'render',lambda folder,check,**kwargs:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
         jobs.retry(task['id']);jobs.queue.join()
         assert jobs.get(task['id'])['status']=='completed'
     finally:

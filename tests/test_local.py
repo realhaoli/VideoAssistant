@@ -115,18 +115,19 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
 def test_real_video_download_embeds_subtitle_tracks_for_source_language(tmp_path, monkeypatch, source_language):
     from local import pipeline
     jobs = JobStore(tmp_path/'tasks')
-    task = jobs.create(modes=['download'], source={'type':'upload', 'filename':'source.mkv'}, options={}, enqueue=False)
+    task = jobs.create(modes=['download', 'subtitles'], source={'type':'upload', 'filename':'source.mkv'}, options={}, enqueue=False)
     folder = jobs.directory(task['id'])
-    zh = [{'start':0,'end':1.5,'text':'中文测试字幕'}]
+    zh = [{'start':0,'end':1.5,'text':'车辆发布会，续航 100 公里。'}]
+    traditional = [{**zh[0], 'text':'車輛發布會，續航 100 公里。'}]
     en = [{**zh[0], 'text':'Welcome to the presentation.'}]
     caption = tmp_path/'source.srt'
-    caption.write_text(subtitles.srt(zh if source_language == 'zho' else en), encoding='utf-8')
+    caption.write_text(subtitles.srt(traditional if source_language == 'zho' else en), encoding='utf-8')
     translated = []
 
     def translate(engine, cues, *, language, **kwargs):
         assert language == 'zh' and cues == en
         translated.append(language)
-        return zh
+        return traditional
 
     monkeypatch.setattr(Intelligence, 'transform', translate)
     video = folder/'source.mkv'
@@ -145,6 +146,8 @@ def test_real_video_download_embeds_subtitle_tracks_for_source_language(tmp_path
         vtt = media.command(['ffmpeg','-v','error','-i',str(result),'-map',f'0:s:{index}','-f','webvtt','pipe:1'])
         assert subtitles.parse(vtt) == expected
     assert translated == (['zh'] if source_language == 'eng' else [])
+    assert (folder/'output/subtitles.zh.txt').read_text(encoding='utf-8') == subtitles.timestamped_text(zh)
+    assert subtitles.parse((folder/'subtitles.original.srt').read_text(encoding='utf-8')) == (traditional if source_language == 'zho' else en)
 
 
 def test_whisper_word_alignment_creates_real_sentence_cues():
@@ -402,17 +405,17 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
     (folder/'uploaded.srt').write_text('1\n00:00:00,000 --> 00:00:05,000\n续航12小时，容量100kWh。\n', encoding="utf-8")
     Image.new('RGB',(200,100),'white').save(folder/'cover.jpg')
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':'5'},'streams':[{'codec_type':'video'}]})
-    monkeypatch.setattr(Intelligence,'plan',lambda *args:{'title':'电池系统','chapters':[{'title':'续航与容量','points':['续航12小时','容量100kWh'],'start':0,'end':5}]})
-    monkeypatch.setattr(Intelligence,'draft',lambda *args:'电池系统续航12小时，容量100kWh。\n\n### 关键参数\n\n| 参数 | 数值 |\n| --- | --- |\n| 续航 | 12小时 |\n| 容量 | 100kWh |')
-    monkeypatch.setattr(Intelligence,'overview',lambda *args:{'one_sentence':'容量100kWh，续航12小时。','key_conclusions':['续航12小时。'],'data_terms':['100kWh：电池容量。']})
+    monkeypatch.setattr(Intelligence,'plan',lambda *args:{'title':'電池系統','chapters':[{'title':'續航與容量','points':['续航12小时','容量100kWh'],'start':0,'end':5}]})
+    monkeypatch.setattr(Intelligence,'draft',lambda *args:'電池系統續航12小時，容量100kWh。\n\n### 關鍵參數\n\n| 參數 | 數值 |\n| --- | --- |\n| 續航 | 12小時 |\n| 容量 | 100kWh |')
+    monkeypatch.setattr(Intelligence,'overview',lambda *args:{'one_sentence':'容量100kWh，續航12小時。','key_conclusions':['續航12小時。'],'data_terms':['100kWh：電池容量。']})
     monkeypatch.setattr(Intelligence,'transform',lambda self,segments,**kwargs:segments)
-    def candidates(path,chapter,output,index,used,check):
+    def candidates(path,chapter,output,index,used,check,**kwargs):
         target=output/'image.jpg';target.parent.mkdir(parents=True,exist_ok=True);Image.new('RGB',(100,80),'blue').save(target)
         return [dict(path=target,time=2,hash=0,quality=10)]
     monkeypatch.setattr(media,'candidates',candidates)
-    monkeypatch.setattr(Intelligence,'select',lambda self,ch,images,body:[dict(index=0,candidate=images[0],caption='系统示意',reason='相关')])
+    monkeypatch.setattr(Intelligence,'select',lambda self,ch,images,body:[dict(index=0,candidate=images[0],caption='系統示意',reason='相关')])
     monkeypatch.setattr(media,'export_video',lambda path,target,details,check,**kwargs:target.write_bytes(b'mp4'))
-    monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
+    monkeypatch.setattr(pdf_export,'render',lambda folder,check,**kwargs:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     pipeline.run(jobs,task['id'])
     artifacts=jobs.get(task['id'])['artifacts']
     expected={name for mode in modes for name,_,_ in exports.ARTIFACTS[mode]}
@@ -424,8 +427,13 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
         with zipfile.ZipFile(output/'illustrated.zip') as z:
             assert set(z.namelist()) == {'illustrated.html','illustrated.md','image/cover.jpg','image/chapter-01.jpg'}
         assert all(a.get('download_name')=='illustrated.zip' for a in artifacts if a['name'].startswith('illustrated.'))
+        assert '系统示意' in (output/'illustrated.md').read_text(encoding='utf-8')
+    if 'text' in modes:
+        report = (output/'text.md').read_text(encoding='utf-8')
+        assert '电池系统' in report and '续航12小时' in report and '電池' not in report and '續航' not in report
     if 'mindmap' in modes:
         assert (folder/'mindmap.json').is_file()
+        assert '续航与容量' in (folder/'mindmap.json').read_text(encoding='utf-8')
         assert not next(a for a in artifacts if a['name']=='mindmap.pdf').get('pending')
 
 
@@ -547,6 +555,41 @@ def test_openai_chat_transport_uses_matching_images_and_model(tmp_path,monkeypat
     assert captured[1]['model']=='hy-vision-2.0-instruct'
 
 
+@pytest.mark.parametrize('protocol', ['openai', 'anthropic'])
+def test_model_read_timeout_is_configurable_and_actionable(monkeypatch, protocol):
+    from types import SimpleNamespace
+    from local import model_client
+
+    class Client:
+        def __init__(self, **kwargs):
+            if protocol == 'openai':
+                assert kwargs['timeout'].read == 210 and kwargs['timeout'].connect == 15
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def mount(self, *args):
+            pass
+
+        def post(self, *args, **kwargs):
+            assert kwargs['timeout'] == (15, 210)
+            raise model_client.requests.exceptions.ReadTimeout()
+
+        def create(self, **kwargs):
+            raise model_client.APITimeoutError(httpx.Request('POST', 'https://example.test/v1/chat/completions'))
+
+    monkeypatch.setenv('MODEL_TIMEOUT_SECONDS', '210')
+    monkeypatch.setattr(model_client, 'OpenAI', Client)
+    monkeypatch.setattr(model_client.requests, 'Session', Client)
+    config = {'llm_api_format': protocol, 'llm_base_url':'https://example.test', 'llm_api_key':'test-key', 'llm_model':'test-model'}
+    with pytest.raises(model_client.ModelTimeoutError, match='检查点'):
+        model_client.complete(config, '问题', '系统指令', None, 100, lambda:None)
+
+
 def test_frame_cache_does_not_reuse_different_chapter_times(tmp_path,monkeypatch):
     from PIL import Image
     calls=[]
@@ -554,7 +597,9 @@ def test_frame_cache_does_not_reuse_different_chapter_times(tmp_path,monkeypatch
         calls.append((timestamp,target.name));Image.new('RGB',(80,40),'white').save(target)
     monkeypatch.setattr(media,'frame',frame)
     monkeypatch.setattr(media,'image_quality',lambda path:5)
-    media.candidates(tmp_path/'source.mp4',{'start':0,'end':60},tmp_path,0,[],lambda:None)
+    progress=[]
+    media.candidates(tmp_path/'source.mp4',{'start':0,'end':60},tmp_path,0,[],lambda:None,progress=progress.append)
+    assert progress == [12.5 * n for n in range(1,9)]
     first={name for _,name in calls};calls.clear()
     media.candidates(tmp_path/'source.mp4',{'start':300,'end':360},tmp_path,0,[],lambda:None)
     assert len(calls)==8 and not first.intersection(name for _,name in calls)

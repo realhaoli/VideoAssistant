@@ -180,7 +180,8 @@ class JobStore:
                         if job["source"].get("type") == "upload" and job.get("stage") == "queued":
                             job.setdefault("upload_complete", False)
                     elif job["status"] in {"running", "queued"}:
-                        job.update(status="queued", stage_progress=None, message="服务恢复，等待继续处理")
+                        job.update(status="queued", stage="queued", stage_progress=None, stage_started_at=time.time(),
+                                   message="服务恢复，等待继续处理")
                     self._persist(job)
                 except OSError:
                     LOGGER.exception("任务已读取，但无法保存恢复状态：%s", directory)
@@ -231,7 +232,10 @@ class JobStore:
     def update_output(self, job_id, mode, **fields):
         with self.lock:
             job = self.jobs[job_id]
-            job.setdefault('output_states',{}).setdefault(mode,{}).update(fields)
+            state = job.setdefault('output_states', {}).setdefault(mode, {})
+            if fields.get('status') == 'running' and (state.get('status') != 'running' or fields.get('stage') != state.get('stage')):
+                fields['stage_started_at'] = time.time()
+            state.update(fields)
             self._persist(job)
 
     def stop(self, timeout=15):
@@ -350,7 +354,10 @@ class JobStore:
                 fields["stage_progress"] = None
             if "title" in fields and job.get("custom_title") and "custom_title" not in fields:
                 fields["title"] = job["custom_title"]
-            job.update(fields, updated_at=time.time())
+            now = time.time()
+            if any(key in fields and fields[key] != job.get(key) for key in ('stage', 'status')):
+                fields['stage_started_at'] = now
+            job.update(fields, updated_at=now)
             self._persist(job)
 
     def rename(self, job_id, title):
@@ -369,8 +376,11 @@ class JobStore:
             total = max(job["progress"], min(percent, 99))
             if job.get("stage") == stage and job["progress"] == total and job.get("stage_progress") == stage_progress and job.get("message") == message:
                 return
-            job.update(stage=stage, progress=total, stage_progress=stage_progress, message=message, updated_at=time.time())
-            event = dict(time=time.time(), stage=stage, message=message, stage_progress=stage_progress)
+            now = time.time()
+            if job.get('stage') != stage or not job.get('stage_started_at'):
+                job['stage_started_at'] = now
+            job.update(stage=stage, progress=total, stage_progress=stage_progress, message=message, updated_at=now)
+            event = dict(time=now, stage=stage, message=message, stage_progress=stage_progress)
             previous = job["events"][-1] if job["events"] else None
             if previous and previous["stage"] == stage and re.sub(r"\d+%", "%", previous["message"]) == re.sub(r"\d+%", "%", message):
                 job["events"][-1] = event

@@ -1,6 +1,7 @@
 """Regressions for failures and resource contention across concurrent tasks."""
 import asyncio
 import errno
+import json
 from pathlib import Path
 import threading
 import time
@@ -13,6 +14,7 @@ import pytest
 from local import media, pipeline, resources
 from local.intelligence import Intelligence
 from local.jobs import JobStore
+from local.model_client import ModelTimeoutError
 from local.stages import Step
 from local.storage import atomic_json
 from local.uploads import UploadLimits
@@ -213,3 +215,40 @@ def test_bad_stage_checkpoint_is_regenerated_and_valid_batches_are_not_rewritten
     count = len(calls)
     assert engine.transform(cues, clean=True) == cues
     assert len(writes) == len(calls) == count
+
+
+def test_translation_timeout_splits_once_and_reuses_the_half_already_saved(tmp_path):
+    engine = Intelligence({}, lambda: None, checkpoint_dir=tmp_path)
+    cues = [{'start': i, 'end': i + 1, 'text': 'A complete line.'} for i in range(24)]
+    calls = []
+
+    def respond(rows, *_):
+        calls.append([row['id'] for row in rows])
+        if len(calls) in {1, 3}:
+            raise ModelTimeoutError()
+        return [{'id': row['id'], 'text': '完整字幕。'} for row in rows]
+
+    engine.subtitle_request = respond
+    with pytest.raises(ModelTimeoutError, match='检查点'):
+        engine.transform(cues, language='zh')
+    assert [len(group) for group in calls] == [24, 12, 12]
+    saved = json.loads(next(tmp_path.glob('*.json')).read_text(encoding='utf-8'))
+    assert set(saved) == {str(index) for index in range(12)}
+    result = engine.transform(cues, language='zh')
+    assert calls[-1] == list(range(12, 24))
+    assert result == [{**cue, 'text': '完整字幕。'} for cue in cues]
+
+
+def test_model_cleanup_timeout_uses_local_rules_without_more_requests(tmp_path):
+    warnings = []
+    engine = Intelligence({}, lambda: None, checkpoint_dir=tmp_path, warning=warnings.append)
+    cues = [{'start': i, 'end': i + 1, 'text': '实质内容 100' if i % 2 else '嗯。'} for i in range(48)]
+    calls = []
+
+    def unavailable(rows, *_):
+        calls.append(len(rows))
+        raise ModelTimeoutError()
+
+    engine.subtitle_request = unavailable
+    assert engine.transform(cues, clean=True) == cues[1::2]
+    assert calls == [24] and any('清洗超时' in warning for warning in warnings)

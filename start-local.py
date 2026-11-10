@@ -92,12 +92,12 @@ def main(argv=None):
         return subprocess.call([str(python), "-m", "playwright", "install", "chromium", "--only-shell",
                                 *(["--with-deps"] if args.with_deps else [])], env=env, cwd=ROOT)
     missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
-    missing += [name for name in ("uvicorn", "fastapi", "faster_whisper", "playwright") if importlib.util.find_spec(name) is None]
+    missing += [name for name in ("uvicorn", "fastapi", "faster_whisper", "playwright", "opencc") if importlib.util.find_spec(name) is None]
     if missing:
         parser.exit(1, "Missing runtime dependencies: " + ", ".join(missing) + ". See README.md.\n")
     if args.check:
         try:
-            for module in ("faster_whisper", "av"):
+            for module in ("faster_whisper", "av", "opencc"):
                 importlib.import_module(module)
         except (ImportError, OSError) as exc:
             parser.exit(1, f"Cannot load native media dependencies: {exc}\nOn Windows, install the Visual C++ x64 runtime.\n")
