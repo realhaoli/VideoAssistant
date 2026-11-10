@@ -59,6 +59,10 @@ def srt(segments):
     return "\n\n".join(f"{i}\n{stamp(s['start'])} --> {stamp(s['end'])}\n{s['text']}" for i, s in enumerate(segments, 1)) + "\n"
 
 
+def timestamped_text(segments):
+    return "\n\n".join(f"[{stamp(cue['start'])} --> {stamp(cue['end'])}]\n{cue['text']}" for cue in segments)
+
+
 def chunks(segments, limit=5500):
     current, length = [], 0
     for i, segment in enumerate(segments):
@@ -72,6 +76,20 @@ def chunks(segments, limit=5500):
         yield current
 
 
+def language_code(code):
+    parts = (code or "").lower().replace("_", "-").split("-")
+    primary = parts[1] if parts[0] == "ai" and len(parts) > 1 else parts[0]
+    if primary in {"zh", "zho", "chi", "cmn", "yue", "chs", "cht"}:
+        return "zh"
+    return "en" if primary in {"en", "eng"} else "original"
+
+
 def language(segments):
-    text = "".join(s["text"] for s in segments)[:4000]
-    return "zh" if len(re.findall(r"[\u4e00-\u9fff]", text)) > len(text) * .15 else "en"
+    text = " ".join(s["text"] for s in segments)[:4000]
+    has_kana = re.search(r"[\u3040-\u30ff]", text)
+    if not has_kana and len(re.findall(r"[\u4e00-\u9fff]", text)) > len(text) * .15:
+        return "zh"
+    # Untagged subtitles need positive evidence of English before translation.
+    words = re.findall(r"\b[a-z]+\b", text.lower())
+    common = {"the", "of", "and", "to", "is", "are", "this", "that", "with", "from", "you", "your", "welcome", "hello", "thanks"}
+    return "en" if sum(word in common for word in words) >= 2 or {"hello", "thanks"}.intersection(words) else "original"

@@ -5,16 +5,18 @@ import os
 import re
 import html
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import List, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from yt_dlp.utils import DownloadError, UnsupportedError
 
 from local import config
 from local.jobs import ACTIVE, Cancelled, store
-from local.media import MEDIA_EXTS
+from local.media import MEDIA_EXTS, preview_link
 from local.storage import atomic_bytes, path_lock, replace_file
 from starlette.background import BackgroundTask
 from urllib.parse import quote
@@ -24,6 +26,7 @@ router = APIRouter(prefix="/api/v1", tags=["Local tasks"])
 
 
 secured = APIRouter()
+link_checks = BoundedSemaphore(2)
 
 
 class Options(BaseModel):
@@ -32,10 +35,14 @@ class Options(BaseModel):
     instructions: str = Field("", max_length=2500)
 
 
-class LinkTask(BaseModel):
+class LinkCheck(BaseModel):
     url: str = Field(..., max_length=4000)
+
+
+class LinkTask(LinkCheck):
     modes: List[str]
     options: Options = Field(default_factory=Options)
+    resource_id: str | None = Field(None, pattern=r"^[a-f0-9]{64}$")
 
 
 def get_job(job_id):
@@ -146,13 +153,41 @@ def rename(job_id: str, body: RenameTask):
             raise HTTPException(400, str(exc))
 
 
+def parse_link(raw_url):
+    try:
+        parsed = urlparse(raw_url.strip())
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            return parsed
+    except ValueError:
+        pass
+    raise HTTPException(400, "请输入完整的 http(s) 视频链接")
+
+
+@secured.post("/tasks/url/inspect")
+def inspect_link(body: LinkCheck):
+    parse_link(body.url)
+    if not link_checks.acquire(blocking=False):
+        raise HTTPException(429, "链接检查繁忙，请稍后重试")
+    try:
+        return preview_link(body.url.strip())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (DownloadError, OSError) as exc:
+        if isinstance(exc.__context__, UnsupportedError):
+            raise HTTPException(422, "此页面没有可识别的音视频，请打开具体的视频或回放页面并提交该链接") from exc
+        raise HTTPException(422, "无法读取链接中的音视频，请检查链接、网络或平台访问权限") from exc
+    finally:
+        link_checks.release()
+
+
 @secured.post("/tasks/url", status_code=202)
 def create_link(body: LinkTask):
-    url = body.url.strip()
-    if urlparse(url).scheme not in {"http", "https"} or not urlparse(url).hostname:
-        raise HTTPException(400, "请输入完整的 http(s) 视频链接")
+    parsed = parse_link(body.url)
+    source = {"type": "url", "url": body.url.strip()}
+    if body.resource_id:
+        source["resource_id"] = body.resource_id
     try:
-        return store.create(modes=body.modes, source={"type": "url", "url": url}, options=body.options.model_dump(), title=urlparse(url).hostname)
+        return store.create(modes=body.modes, source=source, options=body.options.model_dump(), title=parsed.hostname)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -323,6 +358,38 @@ def read_resource(job_id, filename):
         return stream.read().decode("utf-8")
 
 
+def video_subtitle_streams(path):
+    from local.media import TEXT_SUBTITLE_CODECS, probe
+    try:
+        return [stream for stream in probe(path).get('streams', [])
+                if stream.get('codec_type') == 'subtitle' and stream.get('codec_name') in TEXT_SUBTITLE_CODECS]
+    except (OSError, RuntimeError, ValueError, TimeoutError):
+        return []
+
+
+@secured.get("/tasks/{job_id}/video-subtitles/{index}.vtt")
+def video_subtitle(job_id: str, index: int):
+    from local.media import command
+    from local.resources import FFMPEG
+    if not any(a['name'] == 'video.mp4' for a in get_job(job_id)['artifacts']):
+        raise HTTPException(404, '视频尚未生成')
+    with resource_lease(job_id, 'video.mp4'):
+        path = job_directory(job_id) / 'output' / 'video.mp4'
+        if not any(stream['index'] == index for stream in video_subtitle_streams(path)):
+            raise HTTPException(404, '字幕轨不存在')
+        stat = path.stat()
+        cache = path.parent.parent / f'preview-{stat.st_size}-{stat.st_mtime_ns}-{index}.vtt'
+        with path_lock(cache):
+            if cache.is_file():
+                content = cache.read_bytes()
+            else:
+                with FFMPEG.slot():
+                    content = command(['ffmpeg', '-v', 'error', '-i', str(path), '-map', f'0:{index}',
+                                       '-c:s', 'webvtt', '-f', 'webvtt', 'pipe:1'], timeout=60).encode('utf-8')
+                atomic_bytes(cache, content)
+    return Response(content, media_type='text/vtt', headers={'X-Content-Type-Options': 'nosniff'})
+
+
 @secured.get("/tasks/{job_id}/preview/{filename}")
 def preview(job_id: str, filename: str):
     from local import exports
@@ -343,7 +410,18 @@ def preview(job_id: str, filename: str):
     elif path.suffix == ".txt":
         content = exports.page(artifact["label"], '<pre class="transcript">' + html.escape(read_resource(job_id, filename)) + '</pre>')
     elif path.suffix == ".mp4":
-        content = exports.page(artifact["label"], f'<h1>视频预览</h1><video controls preload="metadata" style="width:100%" src="{file_url}"></video>')
+        from local.subtitles import language_code
+        with resource_lease(job_id, filename):
+            streams = video_subtitle_streams(path)
+        codes = [language_code(stream.get('tags', {}).get('language')) for stream in streams]
+        default_index = codes.index('zh') if 'zh' in codes else 0
+        tracks = []
+        for order, (stream, code) in enumerate(zip(streams, codes)):
+            label = {'zh': '中文', 'en': 'English'}.get(code, f'字幕 {order + 1}')
+            default = ' default' if order == default_index else ''
+            track_url = f"/api/v1/tasks/{job_id}/video-subtitles/{stream['index']}.vtt"
+            tracks.append(f'<track kind="subtitles" label="{label}" srclang="{code if code != "original" else "und"}" src="{track_url}"{default}>')
+        content = exports.page(artifact["label"], f'<h1>视频预览</h1><video controls preload="metadata" style="width:100%" src="{file_url}">{"".join(tracks)}</video>')
     else:
         raise HTTPException(404, "暂不支持该预览类型")
     return HTMLResponse(content, headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; img-src data:; media-src 'self'; style-src 'unsafe-inline'; sandbox allow-same-origin"})

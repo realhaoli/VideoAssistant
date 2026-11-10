@@ -1,4 +1,3 @@
-import json
 from functools import partial
 import math
 import os
@@ -8,7 +7,7 @@ from pathlib import Path
 from . import config, exports, media, subtitles, pdf_export
 from .intelligence import Intelligence
 from .report_prompts import VERSION
-from .storage import atomic_bytes, atomic_json, atomic_text, fingerprint, read_checkpoint
+from .storage import atomic_bytes, atomic_json, atomic_text, fingerprint, read_checkpoint, replace_file
 from .jobs import Cancelled, ServiceStopping, OutputFailure
 from .stages import Step, drive
 
@@ -64,8 +63,11 @@ def steps(store, job_id, *, inline=False):
     ready = set()
     artifacts = {entry['name']:entry for entry in store.get(job_id)['artifacts']}
     for mode in modes:
+        required = exports.ARTIFACTS[mode]
+        if mode == 'subtitles' and job.get('subtitle_source_language') == 'en':
+            required = [*required, exports.ENGLISH_SUBTITLES]
         if all(name in artifacts and not artifacts[name].get('pending') and (output/name).stat().st_size == artifacts[name]['size']
-               for name,_,_ in exports.ARTIFACTS[mode]):
+               for name,_,_ in required):
             ready.add(mode)
             store.update_output(job_id, mode, status='completed', progress=100, message='已完成', error=None)
     modes -= ready
@@ -75,34 +77,64 @@ def steps(store, job_id, *, inline=False):
     source = job["source"]
     metadata = {"title": job["title"]}
     media_path = None
+    details = None
     has_video = False
+    errors = {}
     progress("inspect", 3, "检查素材与已有字幕")
 
     if source["type"] == "url":
         metadata_path = folder / "source_info.json"
         saved_metadata = read_checkpoint(metadata_path, lambda value: isinstance(value, dict))
         if saved_metadata is not None:
-            metadata = saved_metadata
-            for lang in ("zh", "en"):
+            for lang in ("zh", "en", "original"):
                 if (folder / f"platform.{lang}.srt").exists():
-                    tracks[lang] = subtitles.parse((folder / f"platform.{lang}.srt").read_text(encoding="utf-8"))
-        else:
-            metadata, tracks = yield Step('inspect', partial(media.inspect_url, source['url'], folder, check, warn))
+                    cues = subtitles.parse((folder / f"platform.{lang}.srt").read_text(encoding="utf-8"))
+                    if cues:
+                        tracks[lang] = cues
+        metadata = saved_metadata if saved_metadata is not None else metadata
+        if saved_metadata is None or ('zh' not in tracks and metadata.get('caption_scan') != media.CAPTION_SCAN_VERSION):
+            try:
+                metadata, tracks = yield Step('inspect', partial(media.inspect_url, source['url'], folder, check, warn,
+                                                                resource_id=source.get('resource_id')))
+            except (Cancelled, ServiceStopping):
+                raise
+            except Exception:
+                if saved_metadata is None:
+                    raise
+                warn('平台字幕重新检查失败，继续使用本地素材或字幕')
         check_duration(metadata.get('duration'))
         title = metadata.get("title") or job["title"]
         folder = store.source_title(job_id, title)
         output = folder / "output"
         output.mkdir(exist_ok=True)
         intelligence.checkpoint_dir = folder / "subtitle-batches"
-        has_reports = bool(modes & {"illustrated", "text", "mindmap"})
-        need_video = "illustrated" in modes or ("download" in modes and not has_reports)
-        if not tracks:
-            progress("download", 8, "下载最高画质视频" if "download" in modes and not has_reports else "下载分析所需的视频" if need_video else "没有可用字幕，下载音频用于本地转写", 0)
-            media_path = yield Step('download', partial(media.download, source['url'], folder,
-                best='download' in modes and need_video, audio=not need_video, check=check,
-                progress=lambda p: progress('download', 8 + p * .14, f'素材下载 {p}%', p)))
     else:
         media_path = folder / source["filename"]
+
+    if source['type'] == 'url' and 'download' in modes and not tracks.get('zh'):
+        # This video also supplies embedded subtitles, ASR audio and frames.
+        try:
+            media_path = yield Step('download', partial(_best_video, source, folder, check,
+                lambda p: progress('download', 8 + p * .14, f'最高画质视频下载 {p}%', p)))
+        except (Cancelled, ServiceStopping):
+            raise
+        except Exception as exc:
+            errors['download'] = config.redact(str(exc))[:1200]
+            store.update_output(job_id, 'download', status='failed', message='处理失败', error=errors['download'])
+            modes.remove('download')
+            if not modes:
+                raise OutputFailure(errors)
+
+    if source["type"] == "url":
+        if "download" in ready:
+            media_path = _existing_best_video(folder) or output / "video.mp4"
+        if not tracks and media_path is None:
+            need_video = "illustrated" in modes
+            progress("download", 8, "下载分析所需的视频" if need_video else "没有可用字幕，下载音频用于本地转写", 0)
+            media_path = yield Step('download', partial(media.download, source['url'], folder,
+                best=False, audio=not need_video, check=check, resource_id=source.get('resource_id'),
+                progress=lambda p: progress('download', 8 + p * .14, f'素材下载 {p}%', p)))
+    else:
         if source.get("subtitle"):
             uploaded = subtitles.parse((folder / source["subtitle"]).read_text(encoding="utf-8-sig"))
             if uploaded:
@@ -110,13 +142,22 @@ def steps(store, job_id, *, inline=False):
     if media_path:
         details = yield Step('inspect', partial(media.probe, media_path))
         metadata["duration"] = float(details.get("format", {}).get("duration") or metadata.get("duration") or 0)
-        has_video = any(s.get("codec_type") == "video" for s in details.get("streams", []))
-        if source['type'] == 'upload' and not has_video and modes <= {'download', 'illustrated'}:
+        has_video = any(s.get("codec_type") == "video" and not s.get('disposition', {}).get('attached_pic')
+                        for s in details.get("streams", []))
+        if 'download' in modes and not has_video:
+            errors['download'] = '该素材没有视频画面'
+            store.update_output(job_id, 'download', status='failed', message='处理失败', error=errors['download'])
+            modes.remove('download')
+            if not modes:
+                raise OutputFailure(errors)
+        if source['type'] == 'upload' and not has_video and modes == {'illustrated'}:
             raise ValueError('该素材没有视频画面，请改选文字汇报、思维导图或字幕文件')
-        if not tracks:
-            tracks = yield Step('inspect', partial(media.embedded_subtitles, media_path, folder, check))
+        if not tracks.get('zh') and media_path != output / 'video.mp4':
+            embedded = yield Step('media', partial(media.embedded_subtitles, media_path, folder, check, warn, details.get('streams', [])))
+            tracks = embedded | tracks
     check_duration(metadata.get('duration'))
-    if not tracks:
+    from_asr = not tracks
+    if from_asr:
         if media_path is None:
             raise ValueError("未找到可供转写的音视频")
         if not metadata.get('duration'):
@@ -148,50 +189,49 @@ def steps(store, job_id, *, inline=False):
             atomic_json(speech_path, speech_data)
         progress("transcribe", 44, "Whisper 转写完成", 100)
         lang = speech_data["language"]
-        tracks["zh" if lang.startswith("zh") else "en" if lang.startswith("en") else "original"] = speech_data["segments"]
+        tracks[subtitles.language_code(lang)] = speech_data["segments"]
         transcript_source = "Whisper 本地转写"
         store.update(job_id, whisper_model=speech_data.get("model", "small"), whisper_device=speech_data.get("device", "cpu"))
     else:
         transcript_source = "素材自带字幕"
-    raw = tracks.get("zh") or tracks.get("en") or tracks.get("original")
-    if not raw:
+    language = next((lang for lang in ('zh', 'en', 'original') if tracks.get(lang)), None)
+    if language is None:
         raise ValueError("字幕为空，无法继续处理")
+    raw = tracks[language]
     metadata["duration"] = max(float(metadata.get("duration") or 0), max(s["end"] for s in raw))
     check_duration(metadata['duration'])
-    (folder / "subtitles.original.srt").write_text(subtitles.srt(raw), encoding="utf-8")
-    store.update(job_id, transcript_source=transcript_source, duration=metadata["duration"])
+    atomic_text(folder / "subtitles.original.srt", subtitles.srt(raw))
+    store.update(job_id, transcript_source=transcript_source, subtitle_source_language=language, duration=metadata["duration"])
     progress("transcript", 45, f"已取得字幕：{transcript_source}")
     model_cache = folder / 'model-checkpoints' / fingerprint(VERSION, intelligence.model_identity())[:24]
-    zh = tracks.get("zh")
-    if zh is None:
-        progress("translate", 46, "翻译中文字幕", 0)
-        zh = yield Step('model', partial(cached, model_cache / f'translated.zh-{fingerprint(raw)[:24]}.json',
-            lambda: intelligence.transform(raw, language='zh', progress=lambda p: progress('translate', 46 + p * 2, f'翻译中文字幕 {round(p * 100)}%', p * 100)), valid_cues))
-        progress("translate", 48, "翻译中文字幕", 100)
-    if options.get("clean_subtitles", True):
-        progress("clean", 49, "字幕清洗", 0)
-        zh = yield Step('model', partial(cached, model_cache / f'cleaned.zh-{fingerprint(zh)[:24]}.json',
-            lambda: intelligence.transform(zh, clean=True, progress=lambda p: progress('clean', 49 + p * 6, f'字幕清洗 {round(p * 100)}%', p * 100)), valid_cues))
-        progress("clean", 55, "字幕清洗", 100)
-    if not zh:
-        raise ValueError("字幕仅含语气词，没有可生成汇报的有效内容；原始字幕已保留")
-    (folder / "subtitles.zh.srt").write_text(subtitles.srt(zh), encoding="utf-8")
-    if "subtitles" in modes:
-        text = "\n\n".join(f"[{subtitles.stamp(s['start'])} --> {subtitles.stamp(s['end'])}]\n{s['text']}" for s in zh)
-        exports.write_text(output / "subtitles.zh.txt", text)
+    zh = raw
+    if from_asr and options.get('clean_subtitles', True):
+        zh = yield Step('model', partial(_transform_subtitles, zh, intelligence, model_cache, progress,
+                                         clean=True, original=language != 'zh'))
+    english = zh if language == 'en' else None
+    if language != 'zh':
+        zh = yield Step('model', partial(_transform_subtitles, zh, intelligence, model_cache, progress))
+    atomic_text(folder / 'subtitles.zh.srt', subtitles.srt(zh))
+    english_caption = None
+    if english is not None and 'download' in modes:
+        english_caption = folder / 'subtitles.en.srt'
+        atomic_text(english_caption, subtitles.srt(english))
+
+    if 'subtitles' in modes:
+        if english is not None:
+            exports.write_text(output / exports.ENGLISH_SUBTITLES[0], subtitles.timestamped_text(english))
+        exports.write_text(output / 'subtitles.zh.txt', subtitles.timestamped_text(zh))
         exports.publish(store, job_id)
-
-    errors = {}
-    if modes - {'subtitles'}:
-        errors = yield Step('outputs', partial(_deliver_outputs, store, job_id, folder, output, modes, options,
-                                               intelligence, zh, metadata, media_path if has_video else None,
-                                               tracks, source, check, warn, model_cache))
-    else:
         store.update_output(job_id, 'subtitles', status='completed', progress=100, message='已完成', error=None)
-
+    pending_outputs = modes - {'subtitles'}
+    if pending_outputs:
+        output_errors = yield Step('outputs', partial(_deliver_outputs, store, job_id, folder, output, pending_outputs,
+            options, intelligence, zh, english_caption, metadata, media_path if has_video else None, details, source, check, warn, model_cache))
+        errors.update(output_errors)
     progress("export", 99, "校验生成文件与资源路径")
     provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
-                  "transcript_source": transcript_source, "language": "zh-CN", "whisper_model": store.get(job_id).get("whisper_model"),
+                  "transcript_source": transcript_source, "language": "zh-CN",
+                  "whisper_model": store.get(job_id).get("whisper_model"),
                   "warnings": store.get(job_id)["warnings"]}
     atomic_json(folder / 'source.json', provenance)
     exports.publish(store, job_id)
@@ -199,32 +239,53 @@ def steps(store, job_id, *, inline=False):
         raise OutputFailure(errors)
 
 
-def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence, zh, metadata, media_path, tracks,
-                     source, check, warn, model_cache):
+def _transform_subtitles(cues, intelligence, model_cache, progress, *, clean=False, original=False):
+    if clean:
+        stage, label, start, span = 'clean', '转写字幕清洗', 46, 4
+        name = 'cleaned.original' if original else 'cleaned.zh'
+        options = {'clean': True}
+    else:
+        stage, label, start, span = 'translate', '翻译中文字幕', 50, 5
+        name = 'translated.zh'
+        options = {'language': 'zh'}
+    progress(stage, start, label, 0)
+    result = cached(model_cache / f'{name}-{fingerprint(cues)[:24]}.json',
+                    lambda: intelligence.transform(cues, **options,
+                        progress=lambda p: progress(stage, start + p * span, f'{label} {round(p * 100)}%', p * 100)),
+                    valid_cues)
+    if not result:
+        raise ValueError('字幕为空或仅含语气词，原始字幕已保留')
+    progress(stage, start + span, label, 100)
+    return result
+
+
+def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence, zh, english_caption, metadata, media_path,
+                     details, source, check, warn, model_cache):
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .output_progress import OutputProgress
     tracker = OutputProgress(store, job_id, modes)
-    if "subtitles" in modes:
-        tracker.done("subtitles")
     branches = {}
     with ThreadPoolExecutor(max_workers=3) as parallel:
         shared_video = None
         if source['type'] == 'url' and 'illustrated' in modes and media_path is None:
-            best = 'download' in modes
-            target = folder / 'original' if best else folder
             download_progress = tracker.for_branch('report', {'illustrated'})
-            shared_video = parallel.submit(media.download, source['url'], target, best=best, audio=False, check=check,
-                progress=lambda p: download_progress('download', 60 + p * .04, f'配图素材下载 {p}%', p))
-        report_modes = modes & {"illustrated", "text", "mindmap"}
+            progress = lambda p: download_progress('download', 60 + p * .04, f'配图素材下载 {p}%', p)
+            if 'download' in modes:
+                shared_video = parallel.submit(_best_video, source, folder, check, progress)
+            else:
+                shared_video = parallel.submit(media.download, source['url'], folder, best=False, audio=False, check=check,
+                                               resource_id=source.get('resource_id'), progress=progress)
+        report_modes = modes - {'download'}
         if report_modes:
-            future = parallel.submit(_report_outputs, store, job_id, folder, output, modes, options,
+            cache_dir = model_cache / f'report-{fingerprint(zh, options, metadata)[:24]}'
+            future = parallel.submit(_report_outputs, store, job_id, folder, output, report_modes, options,
                 intelligence, zh, metadata, media_path, check, warn, tracker.for_branch("report"), tracker,
-                model_cache / f'report-{fingerprint(zh, options, metadata)[:24]}', shared_video)
+                cache_dir, shared_video)
             branches[future] = report_modes
         if "download" in modes:
-            future = parallel.submit(_video_output, store, job_id, folder, output, modes, intelligence,
-                zh, tracks, source, media_path, check, tracker.for_branch("video"), model_cache, shared_video)
+            future = parallel.submit(_video_output, store, job_id, folder, output, source, media_path, details,
+                                     check, tracker.for_branch("video"), shared_video, english_caption)
             branches[future] = {"download"}
         errors = {}
         for future in as_completed(branches):
@@ -239,7 +300,10 @@ def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence
             except (Cancelled, ServiceStopping):
                 raise
             except Exception as exc:
+                states = store.get(job_id)['output_states']
                 for mode in branches[future]:
+                    if states[mode]['status'] == 'completed':
+                        continue
                     errors[mode] = config.redact(str(exc))[:1200]
                     tracker.failed(mode, errors[mode])
             exports.publish(store, job_id)
@@ -396,47 +460,40 @@ def _illustrate(folder, output, sections, intelligence, media_path, metadata, le
     exports.bundle(output)
 
 
-def _video_output(store, job_id, folder, output, modes, intelligence, zh, tracks, source, media_path, check, progress, model_cache, shared_video):
-    progress("bilingual", 93, "准备中英双字幕轨")
-    if shared_video is not None:
+def _video_output(store, job_id, folder, output, source, path, details, check, progress, shared_video, english_caption):
+    if path is None and shared_video is not None:
         progress('download', 93, '等待共用视频下载')
-        media_path = shared_video.result()
-    elif source["type"] == "url" and (media_path is None or not _best_video_ready(media_path, folder)):
-        progress("download", 93, "下载最高画质视频", 0)
-        original = folder / "original"
-        original.mkdir(exist_ok=True)
-        media_path = media.download(source["url"], original, best=True, audio=False, check=check,
-                                    progress=lambda p: progress("download", 93 + p * .01, f"最高画质视频下载 {p}%", p))
-    if media_path is None:
-        raise ValueError('该素材没有视频画面，无法生成带双字幕轨的视频')
-    en = tracks.get("en")
-    if en is None:
-        progress("translate_en", 94, "翻译英文字幕", 0)
-        en = cached(model_cache / f"translated.en-{fingerprint(zh)[:24]}.json", lambda: intelligence.transform(zh, language="en",
-                    progress=lambda p: progress("translate_en", 94 + p, f"翻译英文字幕 {round(p * 100)}%", p * 100)), valid_cues)
-        progress("translate_en", 95, "翻译英文字幕", 100)
-    (folder / "subtitles.en.srt").write_text(subtitles.srt(en), encoding="utf-8")
-    final_video = output / "video.mp4"
-    if not final_video.exists():
-        progress("embed", 95, "封装 MP4 视频与可切换中英字幕轨", 0)
-        temporary = folder / "video.partial.mp4"
+        path = shared_video.result()
+    if path is None:
+        path = _best_video(source, folder, check,
+            lambda p: progress('download', 93 + p * .02, f'最高画质视频下载 {p}%', p))
+    details = details or media.probe(path)
+    check_duration(details.get('format', {}).get('duration'))
+    temporary = folder / 'video.partial.mp4'
+    temporary.unlink(missing_ok=True)
+    try:
+        media.export_video(path, temporary, details, check, caption=folder / 'subtitles.zh.srt',
+            english_caption=english_caption,
+            progress=lambda p: progress('export_video', 96 + p * .02, f'封装视频字幕 {p}%', p))
+        check()
+        replace_file(temporary, output / 'video.mp4')
+    finally:
         temporary.unlink(missing_ok=True)
-        try:
-            media.embed(media_path, folder / "subtitles.zh.srt", folder / "subtitles.en.srt", temporary, check,
-                        progress=lambda p: progress("embed", 95 + p * .03, f"视频封装 {p}%", p))
-            temporary.replace(final_video)
-        finally:
-            temporary.unlink(missing_ok=True)
-        progress("embed", 98, "视频封装完成", 100)
     exports.publish(store, job_id)
 
 
-def _best_video_ready(path, folder):
-    marker = Path(path).parent / "download-complete.json"
-    if not marker.is_file():
-        return False
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-        return value.get("best") and not value.get("audio") and value.get("filename") == Path(path).name and value.get('size', Path(path).stat().st_size) == Path(path).stat().st_size
-    except (OSError, ValueError, AttributeError):
-        return False
+def _existing_best_video(folder):
+    for target in (folder / 'original', folder):
+        checkpoint = read_checkpoint(target / 'download-complete.json', lambda value: isinstance(value, dict)) or {}
+        name = checkpoint.get('filename')
+        if (checkpoint.get('best') and not checkpoint.get('audio') and isinstance(name, str)
+                and Path(name).name == name and (target / name).is_file()):
+            return target / name
+    return None
+
+
+def _best_video(source, folder, check, progress):
+    cached_video = _existing_best_video(folder)
+    target = cached_video.parent if cached_video else folder / 'original'
+    return media.download(source['url'], target, best=True, audio=False, check=check,
+                          progress=progress, resource_id=source.get('resource_id'))

@@ -213,8 +213,9 @@ ARTIFACTS = {
     "text": [("text.html", "文字汇报 HTML", "html"), ("text.md", "文字汇报 Markdown", "markdown")],
     "mindmap": [("mindmap.pdf", "思维导图 PDF", "pdf")],
     "subtitles": [("subtitles.zh.txt", "中文字幕 TXT", "text")],
-    "download": [("video.mp4", "视频 MP4 · 中英字幕", "video")],
+    "download": [("video.mp4", "视频 MP4", "video")],
 }
+ENGLISH_SUBTITLES = ("subtitles.en.txt", "英文字幕 TXT", "text")
 
 
 def publish(store, job_id):
@@ -228,6 +229,8 @@ def publish(store, job_id):
                 continue
             if mode == 'illustrated' and not (output/'illustrated.zip').is_file():
                 continue
+            if mode == 'subtitles' and job.get('subtitle_source_language') == 'en' and (output/'subtitles.zh.txt').is_file():
+                entries = [*entries, ENGLISH_SUBTITLES]
             for name, label, kind in entries:
                 path = output / name
                 pending = name == "mindmap.pdf" and (folder / "mindmap.json").is_file() and not path.exists()
@@ -284,6 +287,8 @@ def normalize_outputs(folder, modes):
             report(output, "illustrated", content)
             bundle(output)
     allowed = {name for mode in modes for name, _, _ in ARTIFACTS.get(mode, [])}
+    if 'subtitles' in modes:
+        allowed.add(ENGLISH_SUBTITLES[0])
     if "illustrated" in modes:
         allowed |= {"image", "illustrated.zip"}
     previous = folder / "previous-results"

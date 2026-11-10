@@ -22,8 +22,8 @@ def test_srt_vtt_and_rolling_timestamps():
 
 
 def test_native_subtitles_before_auto():
-    info = {'subtitles': {'zh-CN': [{'ext':'vtt', 'url':'manual'}]}, 'automatic_captions': {'zh': [{'ext':'vtt', 'url':'auto'}]}}
-    assert media.choose_subtitle(info, 'zh')['url'] == 'manual'
+    info = {'subtitles': {'zh-CN': [{'ext':'vtt', 'url':'manual'}]}, 'automatic_captions': {'ai-zh': [{'ext':'vtt', 'url':'auto'}]}}
+    assert [track['url'] for track in media.subtitle_candidates(info, 'zh')] == ['manual', 'auto']
 
 
 def test_analysis_1080_and_download_best_mp4(tmp_path):
@@ -111,22 +111,40 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg required')
-def test_real_mp4_has_two_switchable_subtitle_tracks(tmp_path):
-    video = tmp_path/'source.mp4'
-    media.command(['ffmpeg','-y','-v','error','-f','lavfi','-i','color=c=green:s=320x180:r=10','-f','lavfi','-i','sine=frequency=600:sample_rate=16000','-t','2','-c:v','libx264','-c:a','aac',str(video)])
-    cues = [{'start':0,'end':1.5,'text':'中文测试字幕'}]
-    zh, en = tmp_path/'zh.srt', tmp_path/'en.srt'
-    zh.write_text(subtitles.srt(cues), encoding="utf-8"); en.write_text(subtitles.srt([dict(cues[0], text='English subtitle')]), encoding="utf-8")
-    result = tmp_path/'result.mp4'
-    progress = []
-    media.embed(video, zh, en, result, lambda: None, progress=progress.append)
-    assert progress[0] == 0 and progress[-1] == 100
-    assert progress == sorted(set(progress))
+@pytest.mark.parametrize('source_language', ['zho', 'eng'])
+def test_real_video_download_embeds_subtitle_tracks_for_source_language(tmp_path, monkeypatch, source_language):
+    from local import pipeline
+    jobs = JobStore(tmp_path/'tasks')
+    task = jobs.create(modes=['download'], source={'type':'upload', 'filename':'source.mkv'}, options={}, enqueue=False)
+    folder = jobs.directory(task['id'])
+    zh = [{'start':0,'end':1.5,'text':'中文测试字幕'}]
+    en = [{**zh[0], 'text':'Welcome to the presentation.'}]
+    caption = tmp_path/'source.srt'
+    caption.write_text(subtitles.srt(zh if source_language == 'zho' else en), encoding='utf-8')
+    translated = []
+
+    def translate(engine, cues, *, language, **kwargs):
+        assert language == 'zh' and cues == en
+        translated.append(language)
+        return zh
+
+    monkeypatch.setattr(Intelligence, 'transform', translate)
+    video = folder/'source.mkv'
+    media.command(['ffmpeg','-y','-v','error','-f','lavfi','-i','color=c=green:s=320x180:r=10',
+                   '-i',str(caption),'-map','0:v','-map','1:s','-t','2','-c:v','libx264','-c:s','srt',
+                   '-metadata:s:s:0',f'language={source_language}',str(video)])
+    pipeline.run(jobs, task['id'])
+    result = folder/'output/video.mp4'
     streams = media.probe(result)['streams']
     tracks = [s for s in streams if s['codec_type'] == 'subtitle']
-    assert {s['tags']['language'] for s in tracks} == {'zho','eng'}
+    assert [s['tags']['language'] for s in tracks] == (['zho', 'eng'] if source_language == 'eng' else ['zho'])
+    assert [s['disposition']['default'] for s in tracks] == ([1, 0] if source_language == 'eng' else [1])
     assert all(s['codec_name']=='mov_text' for s in tracks)
     assert next(s for s in streams if s['codec_type']=='video')['width'] == 320
+    for index, expected in enumerate([zh, en] if source_language == 'eng' else [zh]):
+        vtt = media.command(['ffmpeg','-v','error','-i',str(result),'-map',f'0:s:{index}','-f','webvtt','pipe:1'])
+        assert subtitles.parse(vtt) == expected
+    assert translated == (['zh'] if source_language == 'eng' else [])
 
 
 def test_whisper_word_alignment_creates_real_sentence_cues():
@@ -291,7 +309,7 @@ def test_whisper_settings_validation_and_public_values(tmp_path,monkeypatch):
         config.save({'whisper_model':'unknown-model'})
 
 
-def test_english_sidecar_produces_downloadable_chinese_subtitles(tmp_path,monkeypatch):
+def test_english_sidecar_produces_both_subtitle_downloads(tmp_path,monkeypatch):
     from local import pipeline
     jobs=JobStore(tmp_path/'tasks')
     task=jobs.create(modes=['subtitles'],source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'},options={'clean_subtitles':True},title='英文字幕测试',enqueue=False)
@@ -299,13 +317,18 @@ def test_english_sidecar_produces_downloadable_chinese_subtitles(tmp_path,monkey
     (folder/'source.mp4').write_bytes(b'fixture')
     (folder/'uploaded.srt').write_text('1\n00:00:01,000 --> 00:00:03,000\nWelcome to the presentation.\n', encoding="utf-8")
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':'3'},'streams':[{'codec_type':'video'}]})
-    responses=iter([[{'id':0,'text':'欢迎参加本次汇报。'}],[{'id':0,'text':'欢迎参加本次汇报。'}]])
+    responses=iter([[{'id':0,'text':'欢迎参加本次汇报。'}]])
     monkeypatch.setattr(Intelligence,'chat',lambda *args,**kwargs:next(responses))
     pipeline.run(jobs,task['id'])
     assert '欢迎参加本次汇报' in (folder/'subtitles.zh.srt').read_text(encoding="utf-8")
     assert '00:00:01,000 --> 00:00:03,000' in (folder/'subtitles.zh.srt').read_text(encoding="utf-8")
     assert 'Welcome to the presentation.' in (folder/'subtitles.original.srt').read_text(encoding="utf-8")
-    assert {a['name'] for a in jobs.get(task['id'])['artifacts']} == {'subtitles.zh.txt'}
+    assert {a['name'] for a in jobs.get(task['id'])['artifacts']} == {'subtitles.zh.txt', 'subtitles.en.txt'}
+    english = folder/'output/subtitles.en.txt'
+    assert english.read_text(encoding='utf-8') == '[00:00:01,000 --> 00:00:03,000]\nWelcome to the presentation.'
+    english.unlink()
+    pipeline.run(jobs,task['id'])
+    assert english.is_file()
 
 
 def test_offline_mindmap_uses_original_renderer_and_escapes_data(tmp_path):
@@ -388,7 +411,7 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
         return [dict(path=target,time=2,hash=0,quality=10)]
     monkeypatch.setattr(media,'candidates',candidates)
     monkeypatch.setattr(Intelligence,'select',lambda self,ch,images,body:[dict(index=0,candidate=images[0],caption='系统示意',reason='相关')])
-    monkeypatch.setattr(media,'embed',lambda path,zh,en,target,check,**kwargs:target.write_bytes(b'mp4'))
+    monkeypatch.setattr(media,'export_video',lambda path,target,details,check,**kwargs:target.write_bytes(b'mp4'))
     monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
     pipeline.run(jobs,task['id'])
     artifacts=jobs.get(task['id'])['artifacts']

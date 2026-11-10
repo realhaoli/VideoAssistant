@@ -28,7 +28,7 @@ def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
     cues = [{'start':0,'end':7200,'text':'电池容量100kWh，续航目标600km。'}]
     tracks = {'zh':cues,'en':cues} if native else {}
     downloads, calls = [], []
-    def download(url, target, *, best, audio, check, progress):
+    def download(url, target, *, best, audio, check, progress, resource_id=None):
         target.mkdir(exist_ok=True)
         path = target/('source.m4a' if audio else 'source.mp4')
         path.write_bytes(b'fixture')
@@ -36,7 +36,7 @@ def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
         downloads.append((best,audio)); progress(100)
         return path
     monkeypatch.setattr(media,'download',download)
-    monkeypatch.setattr(media,'inspect_url',lambda *args:({'title':'组合测试','duration':7200}, tracks.copy()))
+    monkeypatch.setattr(media,'inspect_url',lambda *args, **kwargs:({'title':'组合测试','duration':7200}, tracks.copy()))
     monkeypatch.setattr(media,'probe',lambda *args:{'format':{'duration':'7200'},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]})
     monkeypatch.setattr(media,'embedded_subtitles',lambda *args:tracks.copy())
     def transcribe(*args, **kwargs):
@@ -49,9 +49,9 @@ def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
     monkeypatch.setattr(Intelligence,'transform',lambda self,segments,**kwargs:segments)
     monkeypatch.setattr(media,'candidates',lambda *args:[])
     monkeypatch.setattr(pdf_export,'render',lambda folder,check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
-    def embed(source,zh,en,target,check,**kwargs):
-        calls.append('embed');kwargs['progress'](50);target.write_bytes(b'finished video')
-    monkeypatch.setattr(media,'embed',embed)
+    def export_video(source,target,details,check,**kwargs):
+        calls.append('export_video');kwargs['progress'](50);target.write_bytes(b'finished video')
+    monkeypatch.setattr(media,'export_video',export_video)
     jobs.update(task['id'],status='running')
     return jobs, task, folder, downloads, calls
 
@@ -66,9 +66,71 @@ def test_all_output_combinations_complete_without_unselected_outputs(tmp_path, m
     assert {a['name'] for a in finished['artifacts']} == expected
     assert all(value['status']=='completed' for value in finished['output_states'].values())
     assert sum(not audio for _,audio in downloads) <= 1, 'do not download two full video copies'
+    assert calls.count('asr') <= 1, 'do not transcribe separately for each output'
+    if modes == ['download']:
+        assert calls == (['export_video'] if native else ['asr', 'export_video'])
     before = list(calls)
     pipeline.run(jobs,task['id'])
     assert calls == before, 'retry must reuse already completed outputs'
+
+
+@pytest.mark.parametrize('track, asr_language, expected', [
+    ('zh', None, []), ('en', None, ['zh']), ('original', None, ['zh']),
+    (None, 'zh', ['clean']), (None, 'en', ['clean', 'zh']),
+])
+@pytest.mark.parametrize('with_document', [False, True])
+def test_video_and_documents_share_the_same_chinese_subtitles(tmp_path, monkeypatch, track, asr_language, expected, with_document):
+    modes = ['download', 'subtitles', 'text'] if with_document else ['download']
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, modes)
+    jobs.update(task['id'], options={'clean_subtitles': True})
+    cues = [{'start': 0, 'end': 1, 'text': '字幕样本'}]
+    monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {track: cues} if track else {})
+    monkeypatch.setattr(media, 'transcribe', lambda *args, **kwargs: (cues, asr_language) if asr_language else pytest.fail('existing subtitles should bypass ASR'))
+    calls = []
+
+    def transform(engine, segments, *, language=None, clean=False, **kwargs):
+        stage = 'clean' if clean else language
+        calls.append(stage)
+        return [{**cue, 'text': f'{cue["text"]} {stage}'} for cue in segments]
+
+    monkeypatch.setattr(Intelligence, 'transform', transform)
+    plan = Intelligence.plan
+    report_cues = []
+
+    def report_plan(engine, segments, *args):
+        report_cues.extend(segments)
+        return plan(engine, segments, *args)
+
+    monkeypatch.setattr(Intelligence, 'plan', report_plan)
+    pipeline.run(jobs, task['id'])
+    assert (folder / 'output/video.mp4').is_file()
+    video_text = (folder / 'subtitles.zh.srt').read_text(encoding='utf-8').splitlines()[2]
+    assert video_text == ' '.join(['字幕样本', *expected])
+    english = folder / 'output/subtitles.en.txt'
+    if with_document:
+        assert report_cues == [{**cues[0], 'text': video_text}]
+        assert video_text in (folder / 'output/subtitles.zh.txt').read_text(encoding='utf-8')
+    if with_document and (track or asr_language) == 'en':
+        assert english.read_text(encoding='utf-8').splitlines()[1] == ('字幕样本 clean' if asr_language else '字幕样本')
+        assert {a['name'] for a in jobs.get(task['id'])['artifacts']} >= {'subtitles.en.txt', 'subtitles.zh.txt'}
+    else:
+        assert not english.exists()
+    assert calls == expected
+
+
+def test_existing_subtitles_allow_video_when_report_generation_fails(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['download', 'text'])
+    jobs.update(task['id'], options={'clean_subtitles': True})
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('model unavailable')
+
+    monkeypatch.setattr(Intelligence, 'overview', unavailable)
+    with pytest.raises(OutputFailure) as failure:
+        pipeline.run(jobs, task['id'])
+    assert set(failure.value.errors) == {'text'}
+    assert (folder / 'output/video.mp4').is_file()
+    assert jobs.get(task['id'])['output_states']['download']['status'] == 'completed'
 
 
 def test_pdf_failure_preserves_other_outputs_and_retry_only_rebuilds_pdf(tmp_path,monkeypatch):
@@ -133,7 +195,7 @@ def test_existing_subtitles_let_report_finish_while_shared_video_downloads(tmp_p
 
 
 def test_retry_with_current_model_rebuilds_unfinished_model_stages(tmp_path, monkeypatch):
-    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text'])
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text'], native=False)
     jobs.update(task['id'], options={'clean_subtitles': True})
     snapshot = folder / 'model-settings.json'
     snapshot.write_text('{"llm_model":"model-a","whisper_model":"base"}', encoding='utf-8')

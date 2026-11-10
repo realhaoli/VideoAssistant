@@ -851,6 +851,64 @@ input[type="checkbox"] {
   margin-left: 16px;
   color: #409eff;
 }
+.link-resource-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 32px);
+}
+.link-resource-dialog .el-dialog__body {
+  min-height: 0;
+  overflow: auto;
+}
+.link-resources {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 8px 0 0;
+  border: 0;
+}
+.link-resources label {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.link-resources label.selected {
+  background: #ecf5ff;
+  border-color: var(--el-color-primary);
+}
+.link-resources input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin: 2px 0 0;
+  accent-color: var(--el-color-primary);
+}
+.link-resources input:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
+}
+.link-resources small {
+  display: block;
+  color: #606266;
+}
+.link-resource-dialog .el-dialog__footer {
+  flex-shrink: 0;
+}
+.link-resource-dialog .el-dialog__footer .secondary + .primary {
+  margin-left: 8px;
+}
+@media (max-height: 520px) {
+  .link-resources label {
+    padding-block: 8px;
+  }
+}
 .modal-backdrop {
   position: fixed;
   inset: 0;

@@ -5,7 +5,7 @@ import {
   onMounted,
   onBeforeUnmount,
 } from "vue";
-import { ElMessage, ElMessageBox, ElPagination } from "element-plus";
+import { ElDialog, ElMessage, ElMessageBox, ElPagination } from "element-plus";
 import {
   Plus,
   Document,
@@ -34,6 +34,9 @@ const fileInput = ref(null),
   dragging = ref(false),
   submitting = ref(false),
   uploadPercent = ref(0);
+const checkingLink = ref(false);
+const linkChoice = ref(null);
+const selectedResource = ref(null);
 const tasks = ref([]),
   historyTasks = ref([]),
   historyPage = ref(1),
@@ -52,7 +55,7 @@ const activeTask = computed(() =>
   taskDetail.value?.id === selectedId.value ? taskDetail.value : null,
 );
 const exportingPdf = ref(false);
-const artifactOrder = ["illustrated.html", "illustrated.md", "text.html", "text.md", "video.mp4", "mindmap.pdf", "subtitles.zh.txt"];
+const artifactOrder = ["illustrated.html", "illustrated.md", "text.html", "text.md", "video.mp4", "mindmap.pdf", "subtitles.zh.txt", "subtitles.en.txt"];
 const orderedArtifacts = computed(() => [...(activeTask.value?.artifacts || [])]
   .filter(a => artifactOrder.includes(a.name))
   .sort((a,b) => artifactOrder.indexOf(a.name) - artifactOrder.indexOf(b.name)));
@@ -60,7 +63,7 @@ const canSubmit = computed(
   () =>
     modes.value.length &&
     (sourceTab.value === "upload" ? file.value : url.value.trim()) &&
-    !submitting.value,
+    !submitting.value && !linkChoice.value,
 );
 const progressText = (message = "") => message.replace(/Whisper\s+(?:large-v3-turbo|large-v3|medium|small|base|tiny)\s+(?=转写|本地转写)/g, "Whisper ");
 const stageProgressText = computed(() => {
@@ -275,6 +278,36 @@ async function downloadArtifact(task, artifact) {
     exportingPdf.value = false;
   }
 }
+function createLinkTask(payload, resourceId) {
+  return api("/tasks/url", {
+    method: "POST",
+    body: JSON.stringify({ ...payload, resource_id: resourceId }),
+  });
+}
+async function taskSubmitted(task) {
+  await refresh(true);
+  clearTaskForm();
+  openTask(task);
+  ElMessage.success("任务已提交");
+}
+async function confirmResource() {
+  if (!linkChoice.value || !selectedResource.value || submitting.value) return;
+  submitting.value = true;
+  try {
+    const task = await createLinkTask(linkChoice.value.payload, selectedResource.value);
+    linkChoice.value = null;
+    await taskSubmitted(task);
+  } catch (error) {
+    notifyError(error);
+  } finally {
+    submitting.value = false;
+  }
+}
+function resourceDuration(seconds) {
+  const total = Math.floor(seconds);
+  const minutes = Math.floor(total / 60);
+  return `${minutes} 分 ${total % 60} 秒`;
+}
 async function submit() {
   if (!canSubmit.value) return;
   submitting.value = true;
@@ -283,14 +316,20 @@ async function submit() {
   try {
     let task;
     if (sourceTab.value === "url") {
-      task = await api("/tasks/url", {
+      const payload = { url: url.value.trim(), modes: [...modes.value], options };
+      checkingLink.value = true;
+      const { resources, truncated } = await api("/tasks/url/inspect", {
         method: "POST",
-        body: JSON.stringify({
-          url: url.value.trim(),
-          modes: modes.value,
-          options,
-        }),
+        body: JSON.stringify({ url: payload.url }),
       });
+      checkingLink.value = false;
+      if (view.value !== "new" || url.value.trim() !== payload.url) return;
+      if (resources.length > 1 || truncated) {
+        selectedResource.value = null;
+        linkChoice.value = { payload, resources, truncated };
+        return;
+      }
+      task = await createLinkTask(payload, resources[0].id);
     } else {
       const body = new FormData();
       body.append("file", file.value);
@@ -323,13 +362,11 @@ async function submit() {
         xhr.send(body);
       });
     }
-    await refresh(true);
-    clearTaskForm();
-    openTask(task);
-    ElMessage.success("任务已提交");
+    await taskSubmitted(task);
   } catch (error) {
     notifyError(error);
   } finally {
+    checkingLink.value = false;
     submitting.value = false;
   }
 }
@@ -513,6 +550,7 @@ onBeforeUnmount(() => clearInterval(timer));
             <button
               role="tab"
               :aria-selected="sourceTab === 'url'"
+              :disabled="submitting"
               :class="{ selected: sourceTab === 'url' }"
               @click="sourceTab = 'url'"
             >
@@ -520,6 +558,7 @@ onBeforeUnmount(() => clearInterval(timer));
             ><button
               role="tab"
               :aria-selected="sourceTab === 'upload'"
+              :disabled="submitting"
               :class="{ selected: sourceTab === 'upload' }"
               @click="sourceTab = 'upload'"
             >
@@ -573,6 +612,7 @@ onBeforeUnmount(() => clearInterval(timer));
             <div class="url-entry"><input
               id="video-url"
               v-model="url"
+              :disabled="submitting"
               type="url"
               placeholder="请输入视频链接"
               aria-label="视频链接"
@@ -592,6 +632,7 @@ onBeforeUnmount(() => clearInterval(timer));
               class="feature-card"
               :class="{ chosen: modes.includes(feature.id) }"
               role="checkbox"
+              :disabled="submitting"
               :aria-checked="modes.includes(feature.id)"
               :aria-labelledby="`feature-name-${feature.id}`"
               :aria-describedby="`feature-description-${feature.id}${feature.note ? ` feature-note-${feature.id}` : ''}`"
@@ -608,11 +649,10 @@ onBeforeUnmount(() => clearInterval(timer));
             </button>
           </div>
           <p class="timing-note">耗时为参考预估，不含排队；实际随设备、字幕、网速和模型速度变化。</p>
-          <div v-if="submitting" class="upload-progress">
-            <span
-              >正在{{ sourceTab === "upload" ? "上传素材" : "提交任务" }}
-              {{ sourceTab === "upload" ? uploadPercent + "%" : "" }}</span
-            ><el-progress
+          <div v-if="submitting" class="upload-progress" role="status">
+            <span>{{ checkingLink ? "正在检查链接中的音视频资源…" : sourceTab === "upload" ? `正在上传素材 ${uploadPercent}%` : "正在提交任务…" }}</span>
+            <el-progress
+              v-if="sourceTab === 'upload'"
               :percentage="uploadPercent"
               :show-text="false"
               color="#409eff"
@@ -623,7 +663,9 @@ onBeforeUnmount(() => clearInterval(timer));
             <button class="primary" :disabled="!canSubmit" @click="submit">
               <el-icon><Plus /></el-icon
               >{{
-                submitting
+                checkingLink
+                  ? "检查链接中…"
+                  : submitting
                   ? "提交中…"
                   : modes.length === 1 && modes[0] === "download"
                     ? "开始下载"
@@ -831,6 +873,33 @@ onBeforeUnmount(() => clearInterval(timer));
       </div>
     </main>
 
+    <ElDialog
+      :model-value="Boolean(linkChoice)"
+      class="link-resource-dialog"
+      title="选择音视频资源"
+      width="min(520px, calc(100vw - 32px))"
+      align-center
+      :show-close="!submitting"
+      :close-on-press-escape="!submitting"
+      :close-on-click-modal="false"
+      @update:model-value="(open) => { if (!open) linkChoice = null }"
+    >
+      <p v-if="linkChoice?.truncated">此链接包含较多条目，以下为前 30 个条目中识别到的资源。也可以返回并粘贴单个视频链接。</p>
+      <fieldset class="link-resources">
+        <legend>请选择一个要处理的资源</legend>
+        <label v-for="(resource, index) in linkChoice?.resources" :key="resource.id"
+          :class="{ selected: selectedResource === resource.id }">
+          <input v-model="selectedResource" type="radio" name="link-resource" :value="resource.id" :disabled="submitting" />
+          <span>{{ index + 1 }}. {{ resource.title }}<small v-if="resource.duration">{{ resourceDuration(resource.duration) }}</small></span>
+        </label>
+      </fieldset>
+      <template #footer>
+        <button class="secondary" :disabled="submitting" @click="linkChoice = null">取消</button>
+        <button class="primary" :disabled="!selectedResource || submitting" @click="confirmResource">
+          {{ submitting ? "提交中…" : "确认并提交" }}
+        </button>
+      </template>
+    </ElDialog>
     <div v-if="models" class="modal-backdrop" @click.self="models = null">
       <section
         class="model-dialog"

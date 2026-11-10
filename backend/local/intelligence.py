@@ -287,6 +287,10 @@ class Intelligence:
             return False
         if not value.strip():
             return bool(clean and not language and cls._filler_only(cue["text"]))
+        if language == "zh" and value.strip() == cue["text"].strip():
+            foreign = re.findall(r"[\u0400-\u052f\u0590-\u0e7f\u3041-\u30fa\uac00-\ud7a3]", value)
+            if any(character.isalpha() for character in foreign):
+                return False
         if language == "zh" and re.search(r"[a-zA-Z]", cue["text"]) and not re.search(r"[\u4e00-\u9fff]", value):
             # Do not accept an unchanged English sentence as a Chinese translation.
             words = re.findall(r"[a-zA-Z]+", value.lower())

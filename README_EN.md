@@ -1,6 +1,6 @@
 # Video Assistant — Local Chinese Briefing Workspace
 
-The current version provides illustrated briefings, text briefings, mind maps, Chinese subtitles and highest-quality MP4 downloads with switchable Chinese/English subtitle tracks.
+The current version provides illustrated briefings, text briefings, mind maps, Chinese subtitles and highest-quality MP4 downloads with switchable subtitles.
 
 All task state, media, subtitles, model weights and exported files are stored locally. The only remote processing is the configured language/multimodal model API. No OSS, database or cloud ASR is required.
 

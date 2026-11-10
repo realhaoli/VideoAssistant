@@ -318,7 +318,7 @@ def test_cancelled_audio_extraction_is_not_reused_as_complete_audio(tmp_path, mo
 
 
 @pytest.mark.parametrize('report_mode', ['text', 'mindmap'])
-def test_report_with_video_download_accepts_audio_only_analysis_cache(tmp_path, monkeypatch, report_mode):
+def test_report_with_video_download_reuses_video_for_transcription(tmp_path, monkeypatch, report_mode):
     from local import pdf_export
     jobs = JobStore(tmp_path/'tasks')
     job = jobs.create(modes=[report_mode,'download'], source={'type':'url','url':'https://example.test/video'}, options={'clean_subtitles':False}, title='example.test', enqueue=False)
@@ -328,10 +328,11 @@ def test_report_with_video_download_accepts_audio_only_analysis_cache(tmp_path, 
         updates.append((stage, kwargs.get('stage_progress')))
         return original_progress(job_id, stage, percent, message, **kwargs)
     monkeypatch.setattr(jobs, 'progress', record)
-    monkeypatch.setattr(media, 'inspect_url', lambda *args:({'title':'技术分析','duration':5}, {}))
+    monkeypatch.setattr(media, 'inspect_url', lambda *args, **kwargs:({'title':'技术分析','duration':5}, {}))
     downloads = []
     def download(url, folder, *, best, audio, **kwargs):
         downloads.append((best,audio))
+        folder.mkdir(exist_ok=True)
         target = folder/('source.m4a' if audio else 'source.mp4')
         target.write_bytes(b'fixture')
         return target
@@ -344,21 +345,19 @@ def test_report_with_video_download_accepts_audio_only_analysis_cache(tmp_path, 
     monkeypatch.setattr(Intelligence, 'draft', lambda *args:'电池容量100kWh。')
     monkeypatch.setattr(Intelligence, 'overview', lambda *args:{'one_sentence':'电池容量100kWh。','key_conclusions':[],'data_terms':[]})
     def transform(*args, **kwargs):
-        if 'progress' in kwargs:
-            kwargs['progress'](.5)
-        return cues
+        pytest.fail('Chinese ASR with cleaning disabled must bypass subtitle model calls')
     monkeypatch.setattr(Intelligence, 'transform', transform)
     monkeypatch.setattr(pdf_export, 'render', lambda folder, check:(folder/'output/mindmap.pdf').write_bytes(b'%PDF-1.7\n%%EOF'))
-    def embed(source, zh, en, target, check, **kwargs):
+    def export_video(source, target, details, check, **kwargs):
         assert source.suffix == '.mp4' and source.parent.name == 'original'
         kwargs['progress'](50)
+        kwargs['progress'](100)
         target.write_bytes(b'video')
-    monkeypatch.setattr(media, 'embed', embed)
+    monkeypatch.setattr(media, 'export_video', export_video)
     pipeline.run(jobs, job['id'])
-    assert downloads == [(False,True),(True,False)]
+    assert downloads == [(True,False)]
     assert (jobs.directory(job['id'])/'output/video.mp4').read_bytes() == b'video'
-    assert ('translate_en', 50) in updates and ('translate_en', 100) in updates
-    assert ('embed', 50) in updates and ('embed', 100) in updates
+    assert ('export_video', 50) in updates and ('export_video', 100) in updates
     assert {a['name'] for a in jobs.get(job['id'])['artifacts']} == ({'text.html','text.md','video.mp4'} if report_mode=='text' else {'mindmap.pdf','video.mp4'})
 
 

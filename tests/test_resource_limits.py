@@ -268,17 +268,16 @@ def test_multiuser_model_calls_respect_global_and_per_task_limits(monkeypatch):
 
 
 def test_incomplete_download_components_are_never_reused(tmp_path,monkeypatch):
-    import yt_dlp
     for name in ['source.f137.mp4','source.f140.m4a']:(tmp_path/name).write_bytes(b'component')
     called=[]
     class Downloader:
-        def __init__(self,opts):self.opts=opts
+        def __init__(self,opts,**kwargs):self.opts=opts
         def __enter__(self):return self
         def __exit__(self,*args):pass
         def download(self,urls):
             called.append(urls)
             (tmp_path/'source.mp4').write_bytes(b'complete media')
-    monkeypatch.setattr(yt_dlp,'YoutubeDL',Downloader)
+    monkeypatch.setattr(media,'LinkDownloader',Downloader)
     monkeypatch.setattr(media,'probe',lambda path:{'streams':[{'codec_type':'video'},{'codec_type':'audio'}]})
     result=media.download('https://example.test',tmp_path,best=True,audio=False,check=lambda:None,progress=lambda _:None)
     assert called and result.name=='source.mp4'

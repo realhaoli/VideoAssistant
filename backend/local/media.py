@@ -1,6 +1,7 @@
 import json
 from functools import partial
 import hashlib
+from itertools import islice
 import os
 import re
 import shutil
@@ -11,14 +12,18 @@ from pathlib import Path
 
 from .config import DATA, WHISPER_MODELS, WHISPER_DEVICES
 from . import subtitles
+from .links import LinkDownloader, describe_resource
 from .resources import ASR, DOWNLOADS, FFMPEG, FRAMES, ensure_disk, reserve_disk, setting
 from .stages import Step, drive
+from .storage import atomic_json, atomic_text
 
 MODEL_LOCK = threading.Lock()
 MODEL = None
 MODEL_KEY = None
 WHISPER_RUNTIME = {}
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4v"}
+TEXT_SUBTITLE_CODECS = {"subrip", "ass", "webvtt", "mov_text", "text", "ssa"}
+CAPTION_SCAN_VERSION = 1
 
 
 def network_options():
@@ -117,56 +122,76 @@ def download_options(folder, best=False, audio=False):
     )
 
 
-def choose_subtitle(info, prefix):
+def subtitle_candidates(info, language):
+    formats = {"srt": 0, "vtt": 1, "json3": 2}
     for kind in ("subtitles", "automatic_captions"):
         choices = info.get(kind) or {}
-        keys = sorted((k for k in choices if k.lower().startswith(prefix)), key=lambda k: ("orig" not in k, len(k)))
+        keys = sorted((k for k in choices if k.lower() not in {'danmaku', 'live_chat'} and subtitles.language_code(k) == language),
+                      key=lambda k: ("orig" not in k.lower(), k.lower().startswith("ai-"), len(k)))
         for key in keys:
-            entries = sorted(choices[key], key=lambda e: {"srt": 0, "vtt": 1, "json3": 2}.get(e.get("ext"), 10))
+            entries = sorted(choices[key], key=lambda e: formats.get(e.get("ext"), 10))
             for entry in entries:
-                if entry.get("ext") in {"srt", "vtt", "json3"} and entry.get("url"):
-                    return entry
-    return None
+                if entry.get("ext") in formats and entry.get("url"):
+                    yield entry
 
 
-def inspect_url(url, folder, check, warning):
-    from yt_dlp import YoutubeDL
+def preview_link(url):
+    with LinkDownloader({**network_options(), "socket_timeout": 10, "extractor_retries": 0}, preview=True) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise ValueError("未找到可处理的音视频资源")
+    if "resources" not in info:
+        return {"resources": [describe_resource(info)], "truncated": False}
+    if not info["resources"]:
+        raise ValueError("未找到可处理的音视频资源，请提供具体的视频或音频链接")
+    return info
+
+
+def inspect_url(url, folder, check, warning, *, resource_id=None):
     folder.mkdir(parents=True, exist_ok=True)
     tracks = {}
-    with YoutubeDL(network_options()) as ydl:
+    with LinkDownloader(network_options(), resource_id=resource_id) as ydl:
         info = ydl.extract_info(url, download=False)
-        if info.get('is_live'):
-            raise ValueError('暂不处理正在直播的素材，请提交已结束的视频')
-        if info.get("_type") in {"playlist", "multi_video"}:
-            raise ValueError("请提交单个视频链接，暂不支持播放列表")
+        if not info:
+            raise ValueError("未找到可处理的音视频资源")
         check()
-        for lang in ("zh", "en"):
-            track = choose_subtitle(info, lang)
-            if track:
+        # Prefer Chinese regardless of origin, and try another usable track
+        # when an advertised subtitle URL is empty or unavailable.
+        for lang in ("zh", "en", "original"):
+            seen = set()
+            for track in islice(subtitle_candidates(info, lang), 8):
+                check()
+                if track["url"] in seen:
+                    continue
+                seen.add(track["url"])
                 try:
                     with ydl.urlopen(track["url"]) as response:
-                        text = response.read(10 * 1024 * 1024).decode("utf-8-sig")
-                    parsed = subtitles.parse(text)
-                    if parsed:
-                        tracks[lang] = parsed
-                        (folder / f"platform.{lang}.srt").write_text(subtitles.srt(parsed), encoding="utf-8")
+                        data = response.read(10 * 1024 * 1024 + 1)
+                    if len(data) > 10 * 1024 * 1024:
+                        raise ValueError('平台字幕超过大小限制')
+                    parsed = subtitles.parse(data.decode("utf-8-sig"))
                 except Exception as exc:
-                    warning(f"{lang} 平台字幕读取失败，将使用其他字幕或本地转写：{type(exc).__name__}")
+                    warning(f"{lang} 平台字幕读取失败，尝试其他字幕：{type(exc).__name__}")
+                    continue
+                if parsed:
+                    tracks[lang] = parsed
+                    atomic_text(folder / f"platform.{lang}.srt", subtitles.srt(parsed))
+                    break
+            if tracks:
+                break
     metadata = {k: info.get(k) for k in ("title", "duration", "thumbnail", "webpage_url", "uploader")}
     metadata["chapters"] = info.get("chapters") or []
-    from .storage import atomic_json
+    metadata["caption_scan"] = CAPTION_SCAN_VERSION
     atomic_json(folder / "source_info.json", metadata)
     return metadata, tracks
 
 
-def download(url, folder, *, best, audio, check, progress):
+def download(url, folder, *, best, audio, check, progress, resource_id=None):
     with DOWNLOADS.slot(check):
-        return _download(url, folder, best=best, audio=audio, check=check, progress=progress)
+        return _download(url, folder, best=best, audio=audio, check=check, progress=progress, resource_id=resource_id)
 
 
-def _download(url, folder, *, best, audio, check, progress):
-    from yt_dlp import YoutubeDL
-    from .storage import atomic_json
+def _download(url, folder, *, best, audio, check, progress, resource_id):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     maximum = setting('MAX_DOWNLOAD_MB', 16384, high=1_048_576) * 1024**2
@@ -224,7 +249,7 @@ def _download(url, folder, *, best, audio, check, progress):
         opts['progress_hooks'] = [hook]
         opts['postprocessor_hooks'] = [postprocess]
         opts['postprocessor_args'] = {'ffmpeg':['-threads',str(setting('FFMPEG_THREADS',2,high=16))]}
-        with YoutubeDL(opts) as ydl:
+        with LinkDownloader(opts, resource_id=resource_id) as ydl:
             ydl.download([url])
     check()
     files = [p for p in completed_files() if valid(p)]
@@ -257,20 +282,26 @@ def cover(url, output):
     return True
 
 
-def embedded_subtitles(path, folder, check):
+def embedded_subtitles(path, folder, check, warning, streams):
     tracks = {}
-    for stream in probe(path).get("streams", []):
-        if stream.get("codec_type") != "subtitle" or stream.get("codec_name") not in {"subrip", "ass", "webvtt", "mov_text", "text", "ssa"}:
+    for stream in streams:
+        if stream.get("codec_type") != "subtitle" or stream.get("codec_name") not in TEXT_SUBTITLE_CODECS:
             continue
-        lang = stream.get("tags", {}).get("language", "")
-        lang = "zh" if lang in {"zh", "zho", "chi", "zh-CN"} else "en" if lang in {"en", "eng"} else "original"
-        if lang in tracks:
+        code = stream.get("tags", {}).get("language")
+        lang = subtitles.language_code(code)
+        target = folder / f"embedded.{stream['index']}.srt"
+        try:
+            ffmpeg_command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", f"0:{stream['index']}", str(target)], check)
+            parsed = subtitles.parse(target.read_text(encoding="utf-8"))
+        except (RuntimeError, OSError, ValueError) as exc:
+            warning(f"内嵌字幕读取失败，尝试其他字幕：{type(exc).__name__}")
             continue
-        target = folder / f"embedded.{lang}.srt"
-        command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", f"0:{stream['index']}", str(target)], check)
-        parsed = subtitles.parse(target.read_text(encoding="utf-8"))
         if parsed:
-            tracks[lang] = parsed
+            if not code or code.lower() in {"und", "mul"}:
+                lang = subtitles.language(parsed)
+            tracks.setdefault(lang, parsed)
+            if lang == "zh":
+                break
     return tracks
 
 
@@ -552,9 +583,32 @@ def candidates(path, chapter, output, index, used, check):
     return diverse[:4]
 
 
-def embed(path, zh, en, target, check, *, progress=None):
-    budget = int(Path(path).stat().st_size * 1.1)
-    target = Path(target)
+def export_video(path, target, details, check, *, caption, english_caption=None, progress):
+    path, target = Path(path), Path(target)
+    streams = details.get('streams', [])
+    video = [stream for stream in streams if stream.get('codec_type') == 'video'
+             and not stream.get('disposition', {}).get('attached_pic')]
+    if not video:
+        raise ValueError('该素材没有视频画面')
+    size = path.stat().st_size
+    args = ['ffmpeg', '-y', '-v', 'error', '-i', str(path), '-i', str(caption)]
+    if english_caption is not None:
+        args.extend(['-i', str(english_caption)])
+    args.extend(['-map', '0:V', '-map', '0:a?', '-map', '1:s:0', '-c', 'copy', '-c:s', 'mov_text',
+                 '-metadata:s:s:0', 'language=zho', '-disposition:s:0', 'default'])
+    expected_languages = {'zho'}
+    if english_caption is not None:
+        args.extend(['-map', '2:s:0', '-metadata:s:s:1', 'language=eng', '-disposition:s:1', '0'])
+        expected_languages.add('eng')
+    for index, stream in enumerate(video):
+        if stream.get('codec_name') not in {'h264', 'hevc', 'av1', 'vp9', 'mpeg4'}:
+            args.extend([f'-c:v:{index}', 'libx264'])
+    audio = [stream for stream in streams if stream.get('codec_type') == 'audio']
+    for index, stream in enumerate(audio):
+        if stream.get('codec_name') not in {'aac', 'mp3', 'alac'}:
+            args.extend([f'-c:a:{index}', 'aac'])
+    budget = int(size * 1.1)
+    duration = float(details.get('format', {}).get('duration') or 0)
     with reserve_disk(target.parent, budget) as disk:
         def check_output():
             check()
@@ -562,24 +616,14 @@ def embed(path, zh, en, target, check, *, progress=None):
             disk.resize(max(budget - written, 4 * 1024**2))
             ensure_disk(target.parent)
 
-        _embed(path, zh, en, target, check_output, progress=progress)
-
-
-def _embed(path, zh, en, target, check, *, progress=None):
-    details = probe(path)
-    streams = details.get("streams", [])
-    duration = float(details.get("format", {}).get("duration") or 0)
-    video = next((s for s in streams if s.get("codec_type") == "video"), {})
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
-    video_codec = "copy" if video.get("codec_name") in {"h264", "hevc", "av1", "vp9", "mpeg4"} else "libx264"
-    audio_codec = "copy" if audio.get("codec_name") in {"aac", "mp3", "alac"} else "aac"
-    # MP4 soft subtitles use mov_text. Preserve resolution and compatible streams.
-    ffmpeg_command(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(zh), "-i", str(en),
-             "-map", "0:v?", "-map", "0:a?", "-map", "1:0", "-map", "2:0", "-c:v", video_codec, "-c:a", audio_codec, "-c:s", "mov_text", "-movflags", "+faststart",
-             "-metadata:s:s:0", "language=zho", "-metadata:s:s:0", "title=简体中文",
-             "-metadata:s:s:1", "language=eng", "-metadata:s:s:1", "title=English",
-             "-disposition:s:0", "default", "-disposition:s:1", "0", str(target)], check, duration=duration, progress=progress)
-    streams = probe(target).get("streams", [])
-    languages = {s.get("tags", {}).get("language") for s in streams if s.get("codec_type") == "subtitle"}
-    if not {"zho", "eng"} <= languages:
-        raise RuntimeError("中英字幕轨校验未通过")
+        if not duration:
+            progress(0)
+        ffmpeg_command([*args, '-movflags', '+faststart', str(target)], check_output,
+                       duration=duration, progress=lambda percent: progress(min(99, percent)))
+    exported = probe(target).get('streams', [])
+    if not any(stream.get('codec_type') == 'video' for stream in exported):
+        raise RuntimeError('导出的视频校验未通过')
+    languages = {stream.get('tags', {}).get('language') for stream in exported if stream.get('codec_name') == 'mov_text'}
+    if languages != expected_languages:
+        raise RuntimeError('导出的视频字幕轨校验未通过')
+    progress(100)
