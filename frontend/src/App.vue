@@ -58,6 +58,7 @@ const taskDetail = ref(null);
 const activeTask = computed(() =>
   taskDetail.value?.id === selectedId.value ? taskDetail.value : null,
 );
+const processingEvents = computed(() => (activeTask.value?.events || []).slice().reverse());
 const exportingPdf = ref(false);
 const artifactOrder = ["illustrated.html", "illustrated.md", "text.html", "text.md", "video.mp4", "mindmap.pdf", "subtitles.zh.txt", "subtitles.en.txt"];
 const orderedArtifacts = computed(() => [...(activeTask.value?.artifacts || [])]
@@ -975,15 +976,16 @@ onBeforeUnmount(() => {
             </div>
           </section>
           <section class="log-panel">
-            <h2>处理记录</h2>
-            <ol>
-              <li v-for="(event, i) in activeTask.events.slice(-9)" :key="i">
+            <h2 id="processing-log-title">处理记录</h2>
+            <ol v-if="processingEvents.length" :key="activeTask.id" reversed tabindex="0" aria-labelledby="processing-log-title">
+              <li v-for="(event, i) in processingEvents" :key="processingEvents.length - i">
                 <span></span>
                 <div>
                   {{ progressText(event.message) }}<small>{{ date(event.time) }}</small>
                 </div>
               </li>
             </ol>
+            <p v-else class="muted result-wait">暂无处理记录</p>
           </section>
         </div>
 
@@ -1120,6 +1122,7 @@ onBeforeUnmount(() => {
             </div>
           </ElTabPane>
         </ElTabs>
+        <p class="model-shared-note">当前配置为所有用户共用，谨慎修改</p>
         <ModelSettingsActions
           :busy="modelBusy"
           :saving="savingModels"

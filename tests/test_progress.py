@@ -26,6 +26,20 @@ def test_stage_progress_is_independent_and_unknown_stage_clears_it(tmp_path):
     assert jobs.get(job['id'])['progress'] == 0 and jobs.get(job['id'])['stage_progress'] is None
 
 
+def test_processing_history_retains_older_records_after_many_updates(tmp_path):
+    jobs = JobStore(tmp_path)
+    job_id = jobs.create(modes=['text'], source={}, options={}, enqueue=False)['id']
+    for index in range(205):
+        jobs.progress(job_id, 'report', 80, f'完成第 {index + 1} 段', output_updates={})
+    jobs.progress(job_id, 'export', 95, '导出 10%', stage_progress=10)
+    jobs.progress(job_id, 'export', 99, '导出 90%', stage_progress=90)
+    jobs.update(job_id, status='completed')
+    events = jobs._read_record(jobs.directory(job_id) / 'task.json')['events']
+    assert len(events) == 206
+    assert events[0]['message'] == '完成第 1 段'
+    assert events[-1]['message'] == '导出 90%'
+
+
 def test_parallel_stages_keep_independent_start_times_and_progress(tmp_path, monkeypatch):
     jobs = JobStore(tmp_path)
     job = jobs.create(modes=['text', 'mindmap'], source={}, options={}, enqueue=False)

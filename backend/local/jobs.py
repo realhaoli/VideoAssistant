@@ -199,6 +199,11 @@ class JobStore:
                     elif job["status"] in {"running", "queued"}:
                         job.update(status="queued", stage="queued", stage_progress=None, stage_started_at=time.time(),
                                    message="服务恢复，等待继续处理")
+                        if job.get("model_settings_revision") is None and not (folder / "model-settings.json").exists():
+                            try:
+                                self.settings(job_id)
+                            except (OSError, ValueError, TypeError):
+                                LOGGER.warning("无法保存历史任务的模型配置：%s", job_id, exc_info=True)
                     recover_report_installs(folder)
                     self._persist(job)
                 except OSError:
@@ -358,11 +363,14 @@ class JobStore:
                 if not isinstance(revision, str) or not re.fullmatch(r'[a-f0-9]{32}', revision):
                     raise ValueError('任务模型配置版本无效')
                 path = self.directory(job_id) / f'model-settings-{revision}.json'
-                return json.loads(path.read_text(encoding='utf-8'))
-            path = self.directory(job_id) / 'model-settings.json'
-            if not path.exists():
-                atomic_json(path, load(), private=True)
-            return json.loads(path.read_text(encoding="utf-8"))
+            else:
+                path = self.directory(job_id) / 'model-settings.json'
+                if not path.exists():
+                    atomic_json(path, load(), private=True)
+            settings = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                raise ValueError('任务模型配置无效')
+            return settings
 
     def source_title(self, job_id, title):
         with self.lock:
@@ -381,6 +389,10 @@ class JobStore:
             if job_id not in self.jobs:
                 raise KeyError("任务不存在")
             return copy.deepcopy(self.jobs[job_id])
+
+    def output_states(self, job_id):
+        with self.lock:
+            return copy.deepcopy(self.jobs[job_id].get("output_states", {}))
 
     def list(self):
         with self.lock:
@@ -445,7 +457,7 @@ class JobStore:
             if previous and previous["stage"] == stage and re.sub(r"\d+%", "%", previous["message"]) == re.sub(r"\d+%", "%", message):
                 job["events"][-1] = event
             elif not previous or previous["message"] != message:
-                job["events"] = (job["events"] + [event])[-200:]
+                job["events"].append(event)
             tick = time.monotonic()
             if output_updates is None or phase_changed or stage_progress == 100 or tick - self._progress_written.get(job_id, -math.inf) >= 1:
                 self._persist(job)
@@ -454,7 +466,7 @@ class JobStore:
     def warn(self, job_id, message):
         with self.lock:
             warnings = self.jobs[job_id]["warnings"]
-            message = redact(message)
+            message = redact(message, settings=self.settings(job_id))
             if message not in warnings:
                 warnings.append(message)
                 self._persist(self.jobs[job_id])
@@ -742,7 +754,7 @@ class JobStore:
                 message = ('磁盘空间不足，请释放空间后继续处理' if disk_full else
                            '部分产物失败，已完成文件可下载，可继续处理失败项' if completed else '处理失败，可检查原因后重试')
                 try:
-                    error = redact(f'{type(exc).__name__}: {exc}')[:1800]
+                    error = redact(f'{type(exc).__name__}: {exc}', settings=self.settings(job_id))[:1800]
                 except (OSError, ValueError):
                     error = type(exc).__name__
                 self.record_state(job_id, status='partial' if completed else 'failed', message=message, error=error)

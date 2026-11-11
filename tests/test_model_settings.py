@@ -1,6 +1,7 @@
 """Symmetric model configuration filling, with secrets kept on the server."""
 import asyncio
 import json
+import threading
 
 import httpx
 import pytest
@@ -336,3 +337,49 @@ def test_global_save_updates_all_capacities_without_running_other_connection_tes
             assert inference == [("vision-model", True)]
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("legacy_without_snapshot", [False, True])
+def test_saving_shared_settings_does_not_change_running_tasks(isolated_settings, monkeypatch, legacy_without_snapshot):
+    from local import pipeline
+    from local.jobs import JobStore
+    from local.stages import Step
+
+    config.save({"llm_model": "original-model", "llm_api_key": "original-fixture-key",
+                 "llm_context_tokens": 32768, "whisper_model": "small"})
+    jobs = JobStore(isolated_settings.parent / "tasks", workers=1)
+    original = jobs.create(modes=["text"], source={}, options={})
+    if legacy_without_snapshot:
+        (jobs.directory(original["id"]) / "model-settings.json").unlink()
+    started, proceed = threading.Event(), threading.Event()
+    observed = {}
+
+    def steps(store, job_id):
+        def run():
+            if job_id == original["id"]:
+                started.set()
+                assert proceed.wait(5)
+            snapshot = store.settings(job_id)
+            observed[job_id] = (snapshot["llm_model"], snapshot["llm_context_tokens"], snapshot["whisper_model"])
+            if job_id == original["id"]:
+                store.warn(job_id, f'提供方警告 {snapshot["llm_api_key"]}')
+                raise ValueError(f'提供方错误 {snapshot["llm_api_key"]}')
+        yield Step("model", run)
+
+    monkeypatch.setattr(pipeline, "steps", steps)
+    jobs.start()
+    try:
+        assert started.wait(5)
+        config.save({"llm_model": "updated-model", "llm_api_key": "updated-fixture-key",
+                     "llm_context_tokens": 1048576, "whisper_model": "medium"})
+        following = jobs.create(modes=["text"], source={}, options={})
+        proceed.set()
+        jobs.queue.join()
+        assert observed == {original["id"]: ("original-model", 32768, "small"),
+                            following["id"]: ("updated-model", 1048576, "medium")}
+        finished = jobs.get(original["id"])
+        assert finished["warnings"] == ["提供方警告 [已隐藏]"]
+        assert finished["error"] == "ValueError: 提供方错误 [已隐藏]"
+    finally:
+        proceed.set()
+        jobs.stop()

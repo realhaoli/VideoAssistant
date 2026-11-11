@@ -126,7 +126,7 @@ def steps(store, job_id, *, inline=False):
         except (Cancelled, ServiceStopping):
             raise
         except Exception as exc:
-            errors['download'] = config.redact(str(exc))[:1200]
+            errors['download'] = config.redact(str(exc), settings=model_settings)[:1200]
             store.update_output(job_id, 'download', status='failed', message='处理失败', error=errors['download'])
             modes.remove('download')
             if not modes:
@@ -328,8 +328,8 @@ def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence
         except (Cancelled, ServiceStopping):
             raise
         except Exception as exc:
-            states = store.get(job_id)['output_states']
-            errors = {mode: config.redact(str(exc))[:1200] for mode in selected
+            states = store.output_states(job_id)
+            errors = {mode: config.redact(str(exc), settings=intelligence.config)[:1200] for mode in selected
                       if states[mode]['status'] != 'completed'}
         for mode in selected:
             if mode in errors:
@@ -428,7 +428,7 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
         except (Cancelled, ServiceStopping):
             raise
         except Exception as exc:
-            error = config.redact(str(exc))[:1200]
+            error = config.redact(str(exc), settings=intelligence.config)[:1200]
             tracker.failed(mode, error)
             return error
 

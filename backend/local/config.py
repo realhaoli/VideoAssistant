@@ -138,8 +138,8 @@ def save(values):
     return public()
 
 
-def redact(message):
-    for key, value in load().items():
+def redact(message, *, settings=None):
+    for key, value in (load() if settings is None else settings).items():
         if key.endswith("api_key") and value:
             message = message.replace(value, "[已隐藏]")
     return message

@@ -25,7 +25,7 @@ class OutputProgress:
                 start, span = (60,33) if branch == 'report' else (93,5)
                 fraction = min(.99, max(0, (percent-start)/span))
                 self.values[branch] = max(self.values[branch], fraction)
-                states = self.store.get(self.job_id).get('output_states',{})
+                states = self.store.output_states(self.job_id)
                 updates = {}
                 for mode in selected:
                     if states.get(mode,{}).get('status') not in {'completed','failed'}:
@@ -44,12 +44,12 @@ class OutputProgress:
 
     def _finish(self, mode, status, error):
         with self.lock:
-            previous = self.store.get(self.job_id).get('output_states',{}).get(mode,{})
+            previous = self.store.output_states(self.job_id).get(mode,{})
             if previous.get('status') == 'completed':
                 return
             self.store.update_output(self.job_id, mode, status=status, progress=100 if status=='completed' else previous.get('progress',0),
                                      stage_progress=None, message='已完成' if status == 'completed' else '处理失败', error=error)
-            states = self.store.get(self.job_id).get('output_states',{})
+            states = self.store.output_states(self.job_id)
             for branch, modes in self.groups.items():
                 if modes and all(states.get(mode,{}).get('status') in {'completed','failed'} for mode in modes):
                     self.values[branch] = 1

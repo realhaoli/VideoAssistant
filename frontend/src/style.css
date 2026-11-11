@@ -739,6 +739,7 @@ input[type="checkbox"] {
 .model-test-result { min-width: 0; max-height: 64px; overflow: auto; }
 .model-test-result.success { color: #28773d; }
 .model-test-result.error { color: #ad2828; }
+.model-shared-note { flex: none; margin: 9px 3px 0; color: #986019; font-size: 13px; }
 @media (max-width: 480px) {
   .model-tabs .el-tabs__item { font-size: 12px; padding-inline: 4px; }
   .model-test { align-items: stretch; flex-direction: column; }
@@ -810,7 +811,11 @@ input[type="checkbox"] {
   padding: 30px 0;
 }
 .log-panel ol {
-  padding: 0;
+  max-height: min(24rem, 50vh);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  padding: 0 8px 0 0;
   margin: 20px 0 0;
   list-style: none;
 }
@@ -821,7 +826,9 @@ input[type="checkbox"] {
   color: #606266;
   font-size: 12px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
+.log-panel li:last-child { margin-bottom: 0; }
 .log-panel li > span {
   height: 6px;
   width: 6px;
