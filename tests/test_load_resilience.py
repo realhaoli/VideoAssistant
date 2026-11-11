@@ -13,7 +13,7 @@ import pytest
 
 from local import media, pipeline, resources
 from local.intelligence import Intelligence
-from local.jobs import JobStore
+from local.jobs import JobStore, TaskCapacityError
 from local.model_client import ModelTimeoutError
 from local.stages import Step
 from local.storage import atomic_json
@@ -23,7 +23,8 @@ from routers import tasks
 
 def test_parallel_uploads_cannot_both_claim_the_same_disk_space(monkeypatch):
     monkeypatch.setenv('MIN_FREE_DISK_MB', '0')
-    monkeypatch.setattr(resources.shutil, 'disk_usage', lambda _: SimpleNamespace(free=300))
+    free = 300
+    monkeypatch.setattr(resources.shutil, 'disk_usage', lambda _: SimpleNamespace(free=free))
     # Exercise upload admission when the spool and final files share a volume.
     monkeypatch.setattr(resources, '_disk_location', lambda path: (Path(path), 1))
     app = FastAPI()
@@ -34,9 +35,17 @@ def test_parallel_uploads_cannot_both_claim_the_same_disk_space(monkeypatch):
 
         @app.post('/api/v1/tasks/upload')
         async def accept(request: Request):
-            assert len(await request.body()) == 100
+            nonlocal free
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                free -= len(chunk)
+            assert total == 100
             entered.set()
-            await release.wait()
+            try:
+                await asyncio.wait_for(release.wait(), 3)
+            finally:
+                free += total
             return {'ok': True}
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
@@ -51,6 +60,106 @@ def test_parallel_uploads_cannot_both_claim_the_same_disk_space(monkeypatch):
             assert (await client.post(path, content=b'x' * 100)).status_code == 200
 
     asyncio.run(exercise())
+
+
+def test_chunked_upload_only_reserves_future_writes_on_shared_volume(monkeypatch):
+    monkeypatch.setenv('MIN_FREE_DISK_MB', '0')
+    monkeypatch.setattr(resources, '_disk_location', lambda path: (Path(path), 1))
+    free = 450
+    monkeypatch.setattr(resources.shutil, 'disk_usage', lambda _: SimpleNamespace(free=free))
+    app = FastAPI()
+    app.add_middleware(UploadLimits)
+
+    @app.post('/api/v1/tasks/upload')
+    async def accept(request: Request):
+        nonlocal free
+        async for chunk in request.stream():
+            free -= len(chunk)
+        assert request.state.upload_disk.remaining == 200
+        assert request.state.upload_spool.remaining == 0
+        return {'ok': True}
+
+    async def exercise():
+        async def chunks():
+            yield b'x' * 100
+            yield b'x' * 100
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            assert (await client.post('/api/v1/tasks/upload', content=chunks())).status_code == 200
+
+    asyncio.run(exercise())
+    assert free == 250 and not resources._reserved
+
+
+def test_waiting_jobs_keep_only_ids_and_capacity_recovers_after_cancel(tmp_path, monkeypatch):
+    store = JobStore(tmp_path, workers=1)
+    store.active_limit = 1
+    store.pending_limit = 3
+    release = threading.Event()
+
+    def steps(jobs, job_id):
+        yield Step('outputs', lambda: release.wait(5))
+
+    monkeypatch.setattr(pipeline, 'steps', steps)
+    monkeypatch.setattr('local.jobs.load', lambda: {})
+    store.start()
+    try:
+        submitted = [store.create(modes=['text'], source={}, options={}, title=str(index)) for index in range(3)]
+        deadline = time.monotonic() + 3
+        while len(store._deferred) != 2:
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert list(store._deferred) == [item['id'] for item in submitted[1:]]
+        assert len(store._active_stages) == 1
+        with pytest.raises(TaskCapacityError):
+            store.create(modes=['text'], source={}, options={})
+        assert store.cancel(submitted[1]['id'])['status'] == 'cancelled'
+        with store.upload_slot():
+            with pytest.raises(TaskCapacityError):
+                store.create(modes=['text'], source={}, options={})
+        new = store.create(modes=['text'], source={}, options={})
+        release.set()
+        while store.get(new['id'])['status'] != 'completed':
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert store.get(submitted[2]['id'])['status'] == 'completed'
+    finally:
+        release.set()
+        store.stop()
+
+
+def test_http_delete_does_not_hold_job_lock_during_recursive_cleanup(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    removed = store.create(modes=['text'], source={}, options={}, enqueue=False)
+    other = store.create(modes=['text'], source={}, options={}, enqueue=False)
+    store.update(removed['id'], status='completed')
+    entered, release, read = threading.Event(), threading.Event(), threading.Event()
+    purge = store._purge_deleted
+
+    def slow_purge(directory):
+        entered.set()
+        assert release.wait(4)
+        purge(directory)
+
+    monkeypatch.setattr(tasks, 'store', store)
+    monkeypatch.setattr(store, '_purge_deleted', slow_purge)
+    deletion = threading.Thread(target=tasks.remove, args=(removed['id'],))
+    deletion.start()
+    try:
+        assert entered.wait(2)
+        def read_other():
+            store.get(other['id'])
+            read.set()
+        reader = threading.Thread(target=read_other)
+        reader.start()
+        assert read.wait(1)
+        reader.join(timeout=2)
+        with pytest.raises(KeyError):
+            store.get(removed['id'])
+    finally:
+        release.set()
+        deletion.join(timeout=4)
+    assert not list(tmp_path.glob('.deleted-*'))
 
 
 def test_enospc_while_saving_failure_does_not_kill_the_worker(tmp_path, monkeypatch):

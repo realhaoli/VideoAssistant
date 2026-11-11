@@ -143,6 +143,7 @@ def test_two_hour_planning_covers_last_cue_without_one_huge_request(tmp_path):
         seen.extend(batch)
         return {'title':'完整讲座','chapters':[{'title':'技术章节','start_id':0,'start':batch[0]['start'],'end':batch[-1]['end']}]}
     engine._plan_small=plan
+    engine.chat=lambda *args, **kwargs: {'merge':False}
     result=engine.plan(source,7200,{}, {},tmp_path/'plan.json')
     assert seen==source and result['chapters'][0]['start']==0 and result['chapters'][-1]['end']==7200
 
@@ -282,6 +283,40 @@ def test_incomplete_download_components_are_never_reused(tmp_path,monkeypatch):
     result=media.download('https://example.test',tmp_path,best=True,audio=False,check=lambda:None,progress=lambda _:None)
     assert called and result.name=='source.mp4'
     assert json.loads((tmp_path/'download-complete.json').read_text(encoding='utf-8'))['best']
+
+
+def test_ytdlp_merge_uses_cancellable_ffmpeg_and_preserves_components(tmp_path, monkeypatch):
+    from yt_dlp.postprocessor.ffmpeg import FFmpegMergerPP
+    from local.jobs import Cancelled
+
+    paths = [tmp_path / 'source.f137.mp4', tmp_path / 'source.f140.m4a']
+    for path in paths:
+        path.write_bytes(b'component')
+    entered = False
+
+    class Downloader(media.LinkDownloader):
+        def download(self, urls):
+            formats = [{'vcodec':'h264', 'acodec':'none', 'protocol':'https'},
+                       {'vcodec':'none', 'acodec':'aac', 'protocol':'https'}]
+            self.run_pp(FFmpegMergerPP(self), {'filepath':str(tmp_path/'source.mp4'),
+                'requested_formats':formats, '__files_to_merge':[str(path) for path in paths]})
+
+    def ffmpeg(args, check):
+        nonlocal entered
+        assert '-map' in args and '0:v:0' in args and '1:a:0' in args
+        Path(args[-1].removeprefix('file:')).write_bytes(b'incomplete')
+        entered = True
+        check()
+
+    def check():
+        if entered:
+            raise Cancelled('fixture cancel during merge')
+
+    monkeypatch.setattr(media, 'LinkDownloader', Downloader)
+    monkeypatch.setattr(media, 'ffmpeg_command', ffmpeg)
+    with pytest.raises(Cancelled):
+        media.download('https://example.test', tmp_path, best=True, audio=False, check=check, progress=lambda _:None)
+    assert entered and set(tmp_path.iterdir()) == set(paths)
 
 
 def test_upload_guard_rejects_header_and_chunked_body_and_disk_before_processing(monkeypatch):

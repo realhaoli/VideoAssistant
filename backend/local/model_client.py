@@ -1,8 +1,10 @@
 """OpenAI Chat Completions and Anthropic Messages transport adapters."""
 import base64
 import io
+import json
 import os
 import re
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 from openai import APITimeoutError, APIStatusError, OpenAI, Timeout
@@ -10,6 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.exceptions import ReadTimeoutError
 from urllib3.util.retry import Retry
 
+from .config import MAX_MODEL_TOKENS
 from .resources import setting
 
 
@@ -72,7 +75,74 @@ def base_url(url, protocol):
     ending = "/messages" if protocol == "anthropic" else "/chat/completions"
     if value.endswith(ending):
         value = value[:-len(ending)]
-    return value if value.endswith("/v1") else value + "/v1"
+    return value if re.search(r"/v[0-9]+$", value) else value + "/v1"
+
+
+def _read_model_metadata(url, headers):
+    try:
+        with requests.get(url, headers=headers, timeout=(3, 5), allow_redirects=False, stream=True) as response:
+            if response.status_code != 200:
+                return None
+            data = bytearray()
+            for chunk in response.iter_content(65536):
+                data.extend(chunk)
+                if len(data) > 4 * 1024**2:
+                    return None
+            return json.loads(data)
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def discover_model_limits(config, *, visual=False):
+    selected = connection(config, visual)
+    if not all(selected[field] for field in ("key", "model", "url")):
+        return {}
+    anthropic = selected["format"] == "anthropic"
+    headers = ({"x-api-key": selected["key"], "anthropic-version": "2023-06-01"} if anthropic
+               else {"Authorization": f'Bearer {selected["key"]}'})
+    endpoint = base_url(selected["url"], selected["format"]) + "/models"
+    model = quote(selected["model"], safe="")
+    queries = [(endpoint + "/" + model, headers, True), (endpoint, headers, False)]
+    origin = urlsplit(selected["url"])
+    host = origin.hostname or ""
+    if origin.scheme == "https" and (host.endswith(".maas.aliyuncs.com") or host == "dashscope-us.aliyuncs.com"):
+        native = urlunsplit((origin.scheme, origin.netloc, "/api/v1/models", "model=" + model, ""))
+        queries.append((native, {"Authorization": f'Bearer {selected["key"]}'}, False))
+
+    output_fields = ("max_output_tokens", "max_completion_tokens", "max_output_token_length")
+    if anthropic:
+        output_fields += ("max_tokens",)
+    fields = {
+        "context_tokens": (2048, ("context_length", "context_window", "max_context_tokens")),
+        "max_output_tokens": (256, output_fields),
+    }
+    detected = {}
+    for url, auth, detail in queries:
+        result = _read_model_metadata(url, auth)
+        if isinstance(result, dict):
+            native_output = result.get("output")
+            result = native_output.get("models") if isinstance(native_output, dict) else result.get("data", result)
+        if isinstance(result, list):
+            result = next((item for item in result if isinstance(item, dict)
+                           and (item.get("id") or item.get("model")) == selected["model"]), None)
+        if not isinstance(result, dict):
+            continue
+        identity = result.get("id") or result.get("model")
+        if identity != selected["model"] and (identity or not detail):
+            continue
+        records = [result, *(result[key] for key in ("top_provider", "model_info", "token_limits")
+                             if isinstance(result.get(key), dict))]
+        for name, (low, keys) in fields.items():
+            values = [record.get(key) for record in records for key in keys]
+            numeric = [value for value in values if type(value) is int and low <= value <= MAX_MODEL_TOKENS]
+            if name == "context_tokens" and not numeric:
+                values = [record.get("max_input_tokens") or record.get("max_input_token_length") for record in records]
+                numeric = [value for value in values if type(value) is int and low <= value <= MAX_MODEL_TOKENS]
+            if numeric:
+                detected[name] = min(detected.get(name, MAX_MODEL_TOKENS), *numeric)
+        if len(detected) == len(fields):
+            break
+    return detected
 
 
 def complete(config, prompt, system, visual, max_tokens, check):

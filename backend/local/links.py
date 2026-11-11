@@ -7,6 +7,7 @@ import re
 
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.postprocessor.ffmpeg import FFmpegMergerPP
 from yt_dlp.utils import PagedList, extract_attributes, get_element_html_by_class
 
 
@@ -87,6 +88,12 @@ class LinkDownloader(YoutubeDL):
         self.resource_id = resource_id
         self.preview = preview
         self._selection_depth = 0
+        self.merge_runner = None
+
+    def run_pp(self, pp, infodict):
+        if self.merge_runner is not None and isinstance(pp, FFmpegMergerPP):
+            pp.run_ffmpeg_multiple_files = self.merge_runner
+        return super().run_pp(pp, infodict)
 
     def add_default_info_extractors(self):
         self.add_info_extractor(BydReplayListIE())

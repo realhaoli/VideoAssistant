@@ -171,6 +171,196 @@ def test_frame_failure_does_not_block_text_or_pdf(tmp_path, monkeypatch):
     assert (folder / 'output/illustrated.zip').is_file()
 
 
+def test_long_chapter_reuses_completed_figures_after_a_later_segment_fails(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
+    selected = []
+    interrupt = True
+
+    def candidates(path, chapter, output, index, used, check, **kwargs):
+        start = chapter['start']
+        part = int(start // 1800)
+        if interrupt and part == 2:
+            raise OSError('fixture interrupted')
+        return [dict(path=folder/'cover.jpg', time=start+1, hash=((1 << 24) - 1) << (24*part))]
+
+    def select(engine, chapter, images, body):
+        selected.append((chapter['start'], chapter['end']))
+        return [dict(candidate=images[0], caption='技术画面')]
+
+    monkeypatch.setattr(media, 'candidates', candidates)
+    monkeypatch.setattr(Intelligence, 'select', select)
+    with pytest.raises(OutputFailure):
+        pipeline.run(jobs, task['id'])
+    assert len(list(folder.glob('model-checkpoints/**/figure-*.json'))) == 2
+    interrupt = False
+    pipeline.run(jobs, task['id'])
+    assert selected == [(n*1800, (n+1)*1800) for n in range(4)]
+    assert len(json.loads((folder/'image-selections.json').read_text(encoding='utf-8'))) == 4
+
+
+def test_video_outputs_start_when_both_report_slots_are_occupied(tmp_path, monkeypatch):
+    jobs, first, _, _, _ = prepare(tmp_path, monkeypatch, ['text'])
+    occupied = threading.Event()
+    release = threading.Event()
+    report_count = 0
+    lock = threading.Lock()
+    draft = Intelligence.draft
+
+    def slow_draft(*args):
+        nonlocal report_count
+        with lock:
+            report_count += 1
+            if report_count == 2:
+                occupied.set()
+        assert release.wait(8)
+        return draft(*args)
+
+    def submit(modes):
+        task = jobs.create(modes=modes, source={'type':'upload', 'filename':'source.mp4'},
+                           options={}, title='排队测试', enqueue=False)
+        (jobs.directory(task['id']) / 'source.mp4').write_bytes(b'fixture')
+        jobs.update(task['id'], status='queued')
+        jobs.queue.put(task['id'])
+        return task['id']
+
+    monkeypatch.setattr(Intelligence, 'draft', slow_draft)
+    jobs.update(first['id'], status='queued')
+    jobs.start()
+    try:
+        submit(['text'])
+        assert occupied.wait(4)
+        mixed = submit(['text', 'download'])
+        only_video = submit(['download'])
+        deadline = time.monotonic() + 4
+        while any(not (jobs.directory(task) / 'output/video.mp4').exists() for task in (mixed, only_video)):
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert jobs.get(mixed)['output_states']['text']['status'] == 'queued'
+    finally:
+        release.set()
+        jobs.stop()
+
+
+def test_slow_remote_download_does_not_hold_the_video_export_worker(tmp_path, monkeypatch):
+    jobs, remote, _, _, _ = prepare(tmp_path, monkeypatch, ['download'], source='url')
+    jobs.update(remote['id'], status='queued')
+    entered, release = threading.Event(), threading.Event()
+    download = media.download
+
+    def slow_download(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(media, 'download', slow_download)
+    jobs.start()
+    try:
+        assert entered.wait(2)
+        upload = jobs.create(modes=['download'], source={'type':'upload', 'filename':'source.mp4'},
+                             options={}, title='本地上传', enqueue=False)
+        folder = jobs.directory(upload['id'])
+        (folder / 'source.mp4').write_bytes(b'fixture')
+        jobs.update(upload['id'], status='queued')
+        jobs.queue.put(upload['id'])
+        deadline = time.monotonic() + 3
+        while jobs.get(upload['id'])['status'] != 'completed':
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert (folder / 'output/video.mp4').is_file()
+        assert jobs.get(remote['id'])['status'] == 'running'
+    finally:
+        release.set()
+        jobs.stop()
+
+
+@pytest.mark.parametrize('failure', ['bundle', 'install'])
+def test_report_publishes_no_new_files_if_bundle_or_install_fails(tmp_path, monkeypatch, failure):
+    import zipfile
+
+    output = tmp_path / 'output'
+    output.mkdir()
+    lock = threading.RLock()
+    exports.install_report(output, 'illustrated', '# 旧版', lock, lambda: None)
+    names = exports.report_files('illustrated')
+    old = {name: (output / name).read_bytes() for name in names}
+    replace = exports.replace_file
+
+    def fail_install(source, target):
+        if target == output / 'illustrated.html' and source.parent.name.startswith('.report-stage-'):
+            raise OSError('fixture install failure')
+        return replace(source, target)
+
+    def fail_bundle(*args, **kwargs):
+        raise OSError('fixture package failure')
+
+    with monkeypatch.context() as patch:
+        if failure == 'install':
+            patch.setattr(exports, 'replace_file', fail_install)
+        else:
+            patch.setattr(exports, 'bundle', fail_bundle)
+        with pytest.raises(OSError, match='fixture'):
+            exports.install_report(output, 'illustrated', '# 新版', lock, lambda: None)
+    assert {name: (output / name).read_bytes() for name in names} == old
+    exports.install_report(output, 'illustrated', '# 新版', lock, lambda: None)
+    with zipfile.ZipFile(output / 'illustrated.zip') as archive:
+        assert archive.read('illustrated.html') == (output / 'illustrated.html').read_bytes()
+    assert not list(tmp_path.glob('.report-stage-*'))
+
+
+def test_restart_rolls_back_an_interrupted_report_install(tmp_path, monkeypatch):
+    monkeypatch.setattr('local.jobs.load', lambda: {})
+    jobs = JobStore(tmp_path)
+    job = jobs.create(modes=['illustrated'], source={}, options={}, enqueue=False)
+    folder = jobs.directory(job['id'])
+    output = folder / 'output'
+    output.mkdir()
+    exports.install_report(output, 'illustrated', '# 旧版', jobs.lock, lambda: None)
+    names = exports.report_files('illustrated')
+    originals = {name: (output / name).read_bytes() for name in names}
+    exports.publish(jobs, job['id'])
+    jobs.update(job['id'], status='completed')
+
+    staged = folder / '.report-stage-interrupted'
+    backup = staged / 'previous'
+    backup.mkdir(parents=True)
+    (staged / 'install.json').write_text(json.dumps({'mode':'illustrated', 'originals':names}), encoding='utf-8')
+    for name in names[:2]:
+        (output / name).replace(backup / name)
+    (output / names[0]).write_bytes(b'unfinished new version')
+
+    recovered = JobStore(tmp_path)
+    recovered.start()
+    try:
+        assert recovered.get(job['id'])['status'] == 'completed'
+        assert {name: (output / name).read_bytes() for name in names} == originals
+        assert not staged.exists()
+    finally:
+        recovered.stop()
+
+
+def test_failed_shared_plan_names_the_stage_and_preserves_subtitles(tmp_path, monkeypatch):
+    from local import model_client
+
+    plan = Intelligence.plan
+    modes = ['illustrated', 'text', 'mindmap', 'subtitles']
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, modes)
+    monkeypatch.setattr(Intelligence, 'plan', plan)
+    requests = []
+
+    def incomplete(*args):
+        requests.append(args[4])
+        return '{"'
+
+    monkeypatch.setattr(model_client, 'complete', incomplete)
+    with pytest.raises(OutputFailure) as failure:
+        pipeline.run(jobs, task['id'])
+    assert len(requests) == 2
+    assert set(failure.value.errors) == {'illustrated', 'text', 'mindmap'}
+    assert all(message.startswith('章节规划失败') for message in failure.value.errors.values())
+    assert (folder / 'output/subtitles.zh.txt').is_file()
+    assert not (folder / 'chapters.json').exists()
+
+
 def test_pdf_is_published_and_frames_start_while_report_summary_is_waiting(tmp_path, monkeypatch):
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated', 'text', 'mindmap'])
     summary_started, frames_started, release = threading.Event(), threading.Event(), threading.Event()
@@ -196,10 +386,17 @@ def test_pdf_is_published_and_frames_start_while_report_summary_is_waiting(tmp_p
                 assert time.monotonic() < deadline
                 time.sleep(.01)
             assert any(a['name'] == 'mindmap.pdf' and not a.get('pending') for a in jobs.get(task['id'])['artifacts'])
-            assert not (folder / 'output/text.html').exists()
+            expected = {'text.html', 'illustrated.html'}
+            while not expected <= {a['name'] for a in jobs.get(task['id'])['artifacts']}:
+                assert time.monotonic() < deadline
+                time.sleep(.01)
+            assert '电池容量' in (folder / 'output/text.html').read_text(encoding='utf-8')
+            assert '一句话总结' not in (folder / 'output/text.html').read_text(encoding='utf-8')
         finally:
             release.set()
         pending.result(timeout=5)
+    assert '一句话总结' in (folder / 'output/text.html').read_text(encoding='utf-8')
+    assert not list(folder.glob('*.summary-pending'))
 
 
 def test_existing_subtitles_let_report_finish_while_shared_video_downloads(tmp_path, monkeypatch):
@@ -250,6 +447,8 @@ def test_retry_with_current_model_rebuilds_unfinished_model_stages(tmp_path, mon
     monkeypatch.setattr(Intelligence, 'overview', broken_overview)
     with pytest.raises(OutputFailure):
         pipeline.run(jobs, task['id'])
+    assert (folder / 'output/text.html').is_file()
+    assert (folder / 'text.summary-pending').is_file()
     jobs.update(task['id'], status='failed')
     monkeypatch.setattr('local.jobs.load', lambda: {'llm_model': 'model-b', 'whisper_model': 'small'})
     jobs.retry(task['id'], use_current_model=True)
@@ -257,6 +456,46 @@ def test_retry_with_current_model_rebuilds_unfinished_model_stages(tmp_path, mon
     pipeline.run(jobs, task['id'])
     assert seen == ['model-a', 'model-b']
     assert jobs.settings(task['id'])['whisper_model'] == 'base'
+    assert (folder / 'output/text.html').is_file()
+    assert not (folder / 'text.summary-pending').exists()
+
+
+def test_subtitle_model_routes_cleanup_and_translation_and_keeps_cache_on_report_switch(tmp_path, monkeypatch):
+    from local.limits import budget
+
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text'], native=False)
+    jobs.update(task['id'], options={'clean_subtitles':True})
+    settings = {'llm_model':'report-one', 'llm_context_tokens':1000000, 'use_subtitle_model':True,
+                'subtitle_model':'subtitle-model', 'subtitle_context_tokens':24000, 'subtitle_max_output_tokens':4096,
+                'asr_cleanup_mode':'model'}
+    (folder / 'model-settings.json').write_text(json.dumps(settings), encoding='utf-8')
+    transcript = [{'start':0, 'end':5, 'text':'The battery stores 100 kWh.'}]
+    monkeypatch.setattr(media, 'transcribe', lambda *args, **kwargs: (transcript, 'en'))
+    subtitle_calls, report_calls = [], []
+    plan = Intelligence.plan
+
+    def transform(engine, cues, *, language=None, clean=False, **kwargs):
+        subtitle_calls.append((engine.config['llm_model'], budget(engine.config), language, clean))
+        return cues if clean else [dict(cue, text='电池容量100kWh。') for cue in cues]
+
+    def report_plan(engine, *args):
+        report_calls.append(engine.config['llm_model'])
+        if engine.config['llm_model'] == 'report-one':
+            raise RuntimeError('fixture report failure')
+        return plan(engine, *args)
+
+    monkeypatch.setattr(Intelligence, 'transform', transform)
+    monkeypatch.setattr(Intelligence, 'plan', report_plan)
+    with pytest.raises(OutputFailure):
+        pipeline.run(jobs, task['id'])
+    jobs.update(task['id'], status='failed')
+    monkeypatch.setattr('local.jobs.load', lambda: {**settings, 'llm_model':'report-two'})
+    jobs.retry(task['id'], use_current_model=True)
+    pipeline.run(jobs, task['id'])
+    assert subtitle_calls == [
+        ('subtitle-model', (24000, 4096), None, True), ('subtitle-model', (24000, 4096), 'zh', False),
+    ]
+    assert report_calls == ['report-one', 'report-two']
     assert (folder / 'output/text.html').is_file()
 
 

@@ -11,7 +11,9 @@ class OutputProgress:
         self.weights = {key:(4 if key == 'report' else 2) for key,value in self.groups.items() if value}
         self.values = {key:0 for key in self.weights}
         for mode in modes:
-            store.update_output(job_id, mode, status='pending', progress=0, message='等待处理')
+            message = '等待视频产物处理' if mode == 'download' else '等待报告生成'
+            store.update_output(job_id, mode, status='queued', stage='outputs_wait', progress=0,
+                                stage_progress=None, message=message, error=None)
 
     def total(self):
         return 55 + 44 * sum(self.values[k] * weight for k,weight in self.weights.items()) / max(1,sum(self.weights.values()))
@@ -24,12 +26,14 @@ class OutputProgress:
                 fraction = min(.99, max(0, (percent-start)/span))
                 self.values[branch] = max(self.values[branch], fraction)
                 states = self.store.get(self.job_id).get('output_states',{})
+                updates = {}
                 for mode in selected:
                     if states.get(mode,{}).get('status') not in {'completed','failed'}:
                         previous = states.get(mode, {}).get('progress', 0)
-                        self.store.update_output(self.job_id, mode, status='running', stage=stage, progress=max(previous, round(fraction * 100)),
-                                                 message=message, stage_progress=stage_percent)
-                self.store.progress(self.job_id, stage, self.total(), message, stage_progress=stage_percent)
+                        updates[mode] = dict(status='running', stage=stage, progress=max(previous, round(fraction * 100)),
+                                             message=message, stage_progress=stage_percent)
+                self.store.progress(self.job_id, stage, self.total(), message, stage_progress=stage_percent,
+                                    output_updates=updates)
         return progress
 
     def done(self, mode):

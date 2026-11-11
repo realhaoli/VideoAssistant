@@ -1,5 +1,7 @@
+from hashlib import sha256
 from functools import partial
 import math
+from itertools import islice
 import os
 import re
 from pathlib import Path
@@ -9,7 +11,7 @@ from .intelligence import Intelligence
 from .report_prompts import VERSION
 from .storage import atomic_bytes, atomic_json, atomic_text, fingerprint, read_checkpoint, replace_file
 from .jobs import Cancelled, ServiceStopping, OutputFailure
-from .stages import Step, drive
+from .stages import ParallelSteps, Step, drive
 
 
 def cached(path, generate, valid=lambda value: isinstance(value, (dict, list))):
@@ -57,12 +59,16 @@ def steps(store, job_id, *, inline=False):
     def progress(stage, percent, message, stage_percent=None):
         store.progress(job_id, stage, percent, message, stage_progress=stage_percent)
     modes, options = set(job["modes"]), job["options"]
+    exports.recover_report_installs(folder)
     exports.normalize_outputs(folder, modes)
-    intelligence = Intelligence(store.settings(job_id), check, checkpoint_dir=folder / "subtitle-batches", warning=warn)
+    model_settings = store.settings(job_id)
+    intelligence = Intelligence(model_settings, check, checkpoint_dir=folder / "subtitle-batches", warning=warn)
     exports.publish(store, job_id)
     ready = set()
     artifacts = {entry['name']:entry for entry in store.get(job_id)['artifacts']}
     for mode in modes:
+        if (folder / f'{mode}.summary-pending').exists():
+            continue
         required = exports.ARTIFACTS[mode]
         if mode == 'subtitles' and job.get('subtitle_source_language') == 'en':
             required = [*required, exports.ENGLISH_SUBTITLES]
@@ -205,10 +211,17 @@ def steps(store, job_id, *, inline=False):
     store.update(job_id, transcript_source=transcript_source, subtitle_source_language=language, duration=metadata["duration"])
     progress("transcript", 45, f"已取得字幕：{transcript_source}")
     model_cache = folder / 'model-checkpoints' / fingerprint(VERSION, intelligence.model_identity())[:24]
+    cleanup_mode = model_settings.get('asr_cleanup_mode', config.default_asr_cleanup_mode())
+    clean_asr = from_asr and options.get('clean_subtitles', True)
+    subtitle_engine, subtitle_cache = intelligence, model_cache
+    if model_settings.get('use_subtitle_model') and (language != 'zh' or clean_asr and cleanup_mode == 'model'):
+        subtitle_engine = Intelligence(config.subtitle_model_settings(model_settings), check,
+                                       checkpoint_dir=intelligence.checkpoint_dir, warning=warn)
+        subtitle_cache = folder / 'model-checkpoints' / fingerprint(VERSION, subtitle_engine.model_identity())[:24]
     zh = raw
-    if from_asr and options.get('clean_subtitles', True):
-        if os.getenv('ASR_CLEANUP_MODE', 'local').strip().lower() == 'model':
-            zh = yield Step('model', partial(_transform_subtitles, zh, intelligence, model_cache, progress,
+    if clean_asr:
+        if cleanup_mode == 'model':
+            zh = yield Step('model', partial(_transform_subtitles, zh, subtitle_engine, subtitle_cache, progress,
                                              clean=True, original=language != 'zh'))
         else:
             progress('clean', 46, '本地清理转写字幕', 0)
@@ -218,7 +231,7 @@ def steps(store, job_id, *, inline=False):
             progress('clean', 50, '本地清理转写字幕', 100)
     english = zh if language == 'en' else None
     if language != 'zh':
-        zh = yield Step('model', partial(_transform_subtitles, zh, intelligence, model_cache, progress))
+        zh = yield Step('model', partial(_transform_subtitles, zh, subtitle_engine, subtitle_cache, progress))
     zh = [dict(cue, text=subtitles.simplified(cue['text'])) for cue in zh]
     atomic_text(folder / 'subtitles.zh.srt', subtitles.srt(zh))
     english_caption = None
@@ -234,8 +247,8 @@ def steps(store, job_id, *, inline=False):
         store.update_output(job_id, 'subtitles', status='completed', progress=100, message='已完成', error=None)
     pending_outputs = modes - {'subtitles'}
     if pending_outputs:
-        output_errors = yield Step('outputs', partial(_deliver_outputs, store, job_id, folder, output, pending_outputs,
-            options, intelligence, zh, english_caption, metadata, media_path if has_video else None, details, source, check, warn, model_cache))
+        output_errors = yield from _deliver_outputs(store, job_id, folder, output, pending_outputs,
+            options, intelligence, zh, english_caption, metadata, media_path if has_video else None, details, source, check, warn, model_cache)
         errors.update(output_errors)
     progress("export", 99, "校验生成文件与资源路径")
     provenance = {"title": metadata.get("title"), "source": source.get("url") or source.get("original_name"),
@@ -270,54 +283,77 @@ def _transform_subtitles(cues, intelligence, model_cache, progress, *, clean=Fal
 
 def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence, zh, english_caption, metadata, media_path,
                      details, source, check, warn, model_cache):
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import Future, wait
     from .output_progress import OutputProgress
-    tracker = OutputProgress(store, job_id, modes)
-    branches = {}
-    with ThreadPoolExecutor(max_workers=3) as parallel:
-        shared_video = None
-        if source['type'] == 'url' and 'illustrated' in modes and media_path is None:
-            download_progress = tracker.for_branch('report', {'illustrated'})
-            progress = lambda p: download_progress('download', 60 + p * .04, f'配图素材下载 {p}%', p)
-            if 'download' in modes:
-                shared_video = parallel.submit(_best_video, source, folder, check, progress)
-            else:
-                shared_video = parallel.submit(media.download, source['url'], folder, best=False, audio=False, check=check,
-                                               resource_id=source.get('resource_id'), progress=progress)
-        report_modes = modes - {'download'}
-        if report_modes:
-            cache_dir = model_cache / f'report-{fingerprint(zh, options, metadata)[:24]}'
-            future = parallel.submit(_report_outputs, store, job_id, folder, output, report_modes, options,
-                intelligence, zh, metadata, media_path, check, warn, tracker.for_branch("report"), tracker,
-                cache_dir, shared_video)
-            branches[future] = report_modes
-        if "download" in modes:
-            future = parallel.submit(_video_output, store, job_id, folder, output, source, media_path, details,
-                                     check, tracker.for_branch("video"), shared_video, english_caption)
-            branches[future] = {"download"}
-        errors = {}
-        for future in as_completed(branches):
-            try:
-                branch_errors = future.result() or {}
-                errors.update(branch_errors)
-                for mode in branches[future]:
-                    if mode in branch_errors:
-                        tracker.failed(mode, branch_errors[mode])
-                    else:
-                        tracker.done(mode)
-            except (Cancelled, ServiceStopping):
-                raise
-            except Exception as exc:
-                states = store.get(job_id)['output_states']
-                for mode in branches[future]:
-                    if states[mode]['status'] == 'completed':
-                        continue
-                    errors[mode] = config.redact(str(exc))[:1200]
-                    tracker.failed(mode, errors[mode])
-            exports.publish(store, job_id)
 
-    return errors
+    tracker = OutputProgress(store, job_id, modes)
+    work = []
+    shared_video = None
+    if source['type'] == 'url' and modes & {'illustrated', 'download'} and media_path is None:
+        material = Future()
+        report_transfer = tracker.for_branch('report', {'illustrated'}) if 'illustrated' in modes else None
+        video_transfer = tracker.for_branch('video') if 'download' in modes else None
+
+        def transfer_progress(percent):
+            if report_transfer:
+                report_transfer('download', 60 + (percent or 0) * .04, '下载配图素材', percent)
+            if video_transfer:
+                video_transfer('download', 93 + (percent or 0) * .02, '下载最高画质视频', percent)
+
+        def fetch():
+            try:
+                check()
+                transfer_progress(None)
+                if 'download' in modes:
+                    path = _best_video(source, folder, check, transfer_progress)
+                else:
+                    path = media.download(source['url'], folder, best=False, audio=False, check=check,
+                                          resource_id=source.get('resource_id'), progress=transfer_progress)
+                material.set_result(path)
+            except Exception as exc:
+                material.set_exception(exc)
+            return {}
+
+        def shared_video():
+            while not material.done():
+                check()
+                wait((material,), timeout=.25)
+            return material.result()
+
+        work.append(Step('download', fetch))
+
+    def produce(selected, generate):
+        try:
+            errors = generate() or {}
+        except (Cancelled, ServiceStopping):
+            raise
+        except Exception as exc:
+            states = store.get(job_id)['output_states']
+            errors = {mode: config.redact(str(exc))[:1200] for mode in selected
+                      if states[mode]['status'] != 'completed'}
+        for mode in selected:
+            if mode in errors:
+                tracker.failed(mode, errors[mode])
+            else:
+                tracker.done(mode)
+        exports.publish(store, job_id)
+        return errors
+
+    report_modes = modes - {'download'}
+    if report_modes:
+        cache_dir = model_cache / f'report-{fingerprint(zh, options, metadata)[:24]}'
+        report = partial(_report_outputs, store, job_id, folder, output, report_modes, options,
+                         intelligence, zh, metadata, media_path, check, warn, tracker.for_branch('report'), tracker,
+                         cache_dir, shared_video)
+        work.append(Step('outputs', partial(produce, report_modes, report)))
+    if 'download' in modes:
+        video = partial(_video_output, store, job_id, folder, output, media_path, details,
+                        check, tracker.for_branch('video'), shared_video, english_caption)
+        work.append(Step('video_output', partial(produce, {'download'}, video), after=0 if shared_video else None))
+    if len(work) == 1:
+        return (yield work[0])
+    results = yield ParallelSteps(tuple(work))
+    return {mode: message for result in results for mode, message in result.items()}
 
 
 def _report_outputs(store, job_id, folder, output, modes, options, intelligence, zh, metadata, media_path,
@@ -326,7 +362,7 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
 
     progress("chapters", 60, "按完整内容组织中文汇报章节")
     plan = intelligence.plan(zh, metadata["duration"], options, metadata, cache_dir / f"plan-{VERSION}.json",
-                             lambda p: progress("chapters", 60 + p * 3, "组织汇报章节", p * 100))
+                             lambda p: progress("chapters", 60 + p * 3, "规划章节并核对窗口边界", p * 100))
     plan = dict(plan, title=subtitles.simplified(plan['title']), chapters=[
         dict(chapter, title=subtitles.simplified(chapter['title']))
         for chapter in plan['chapters']
@@ -357,6 +393,9 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
         progress('report', 63 + fraction * 25, f'已完成 {index + 1}/{len(chapters)} 章正文', fraction * 100)
 
     report_modes = modes & {'text', 'illustrated'}
+    title = re.sub(r"[<>\n]", "", str(plan['title']))
+    table_of_contents = "**目录**\n\n[TOC]\n\n"
+    base_lead = f"# {title}\n\n" + table_of_contents
 
     def summarize():
         summary_progress = tracker.for_branch('report', report_modes - {'illustrated'})
@@ -364,11 +403,10 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
         overview = cached(cache_dir / f'overview-{fingerprint(sections)[:24]}.json',
                           lambda: intelligence.overview([(chapter, body) for chapter, _, body in sections]),
                           valid_overview)
-        title = re.sub(r"[<>\n]", "", str(plan['title']))
         lead = f"# {title}\n\n**一句话总结：** {subtitles.simplified(overview['one_sentence'])}\n\n"
         if overview['key_conclusions']:
             lead += "## 核心结论\n\n" + "\n".join("- " + subtitles.simplified(v) for v in overview['key_conclusions']) + "\n\n"
-        lead += "**目录**\n\n[TOC]\n\n"
+        lead += table_of_contents
         terms = ""
         if overview['data_terms']:
             terms = "\n\n## 关键数据与术语\n\n" + "\n".join("- " + subtitles.simplified(v) for v in overview['data_terms'])
@@ -397,25 +435,39 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
     errors = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         summary = pool.submit(summarize) if report_modes else None
+
+        def deliver_report(mode, body):
+            marker = folder / f'{mode}.summary-pending'
+
+            def write(lead, terms=''):
+                check()
+                exports.install_report(output, mode, lead + body + terms, store.lock, check)
+                exports.publish(store, job_id)
+
+            if not summary.done() or summary.exception() is not None:
+                required = [output / name for name in exports.report_files(mode)]
+                if not marker.exists() or not all(path.is_file() for path in required):
+                    atomic_text(marker, 'pending\n')
+                    write(base_lead)
+                tracker.for_branch('report', {mode})('overview', 92, '正文可下载，正在生成汇报摘要')
+            lead, terms = summary.result()
+            write(lead, terms)
+            marker.unlink(missing_ok=True)
+
         futures = {}
         if 'mindmap' in modes:
             futures[pool.submit(produce, 'mindmap', mindmap)] = 'mindmap'
         if 'illustrated' in modes:
-            generate = partial(_illustrate, folder, output, sections, intelligence, media_path, metadata,
-                               summary, check, warn, tracker.for_branch('report', {'illustrated'}), shared_video)
-            futures[pool.submit(produce, 'illustrated', generate)] = 'illustrated'
+            def illustrated():
+                body = _illustrate(folder, output, sections, intelligence, media_path, metadata,
+                                   check, warn, tracker.for_branch('report', {'illustrated'}), shared_video, cache_dir, zh)
+                deliver_report('illustrated', body)
+
+            futures[pool.submit(produce, 'illustrated', illustrated)] = 'illustrated'
         if 'text' in modes:
-            try:
-                lead, terms = summary.result()
-                check()
-                exports.report(output, 'text', lead + "\n\n".join(heading + body for _, heading, body in sections) + terms)
-                exports.publish(store, job_id)
-                tracker.done('text')
-            except (Cancelled, ServiceStopping):
-                raise
-            except Exception as exc:
-                errors['text'] = config.redact(str(exc))[:1200]
-                tracker.failed('text', errors['text'])
+            error = produce('text', lambda: deliver_report('text', "\n\n".join(heading + body for _, heading, body in sections)))
+            if error is not None:
+                errors['text'] = error
         for future in as_completed(futures):
             error = future.result()
             if error is not None:
@@ -423,9 +475,9 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
     return errors
 
 
-def _illustrate(folder, output, sections, intelligence, media_path, metadata, summary, check, warn, progress, shared_video):
+def _illustrate(folder, output, sections, intelligence, media_path, metadata, check, warn, progress, shared_video, cache_dir, zh):
     if shared_video is not None:
-        media_path = shared_video.result()
+        media_path = shared_video()
     if media_path is None:
         raise ValueError('图文汇报需要视频画面')
     progress('illustrated_cover', 89, '准备汇报封面')
@@ -445,62 +497,125 @@ def _illustrate(folder, output, sections, intelligence, media_path, metadata, su
         atomic_bytes(output / 'image' / 'cover.jpg', cover.read_bytes())
 
     used, selections, illustrated = [], [], []
+    media_stat = media_path.stat()
+    visual_config = (intelligence.config.get('use_vlm', True), intelligence.model_identity(visual=True))
+    media_identity = (media_path.name, media_stat.st_size, media_stat.st_mtime_ns)
     for index, (chapter, heading, body) in enumerate(sections):
         check()
-        if summary.done():
-            summary.result()
-        chapter_label = f'第 {index + 1}/{len(sections)} 章'
-        chapter_progress = 89 + index / len(sections) * 3
-        def frame_progress(percent):
-            progress('illustrated_frames', chapter_progress, f'{chapter_label}抽取候选画面', percent)
-
-        frame_progress(0)
-        images = media.candidates(media_path, chapter, folder / f'frames-{VERSION}', index, used, check, progress=frame_progress)
-        ranked = [dict(candidate=image, caption='原视频画面 · ' + chapter['title'], reason='清晰度与去重筛选') for image in images]
-        if images and intelligence.config.get('use_vlm', True):
-            progress('illustrated_review', chapter_progress, f'{chapter_label}按正文评选画面')
-            try:
-                ranked = intelligence.select(chapter, images, body)
-            except Exception as exc:
-                check()
-                warn(f'第 {index + 1} 章视觉评选不可用，采用清晰度选帧：{type(exc).__name__}')
-        choice = next((entry for entry in ranked if not any(
-            (entry['candidate']['hash'] ^ other).bit_count() < 12 for other in used)), None)
-        figure = ''
-        if choice:
-            selected = choice['candidate']
-            used.append(selected['hash'])
-            relative = f'image/chapter-{index + 1:02d}.jpg'
-            atomic_bytes(output / relative, Path(selected['path']).read_bytes())
-            caption = re.sub(r"[\[\]<>\n]", "", subtitles.simplified(str(choice.get('caption') or chapter['title'])))
-            stamp = subtitles.stamp(selected['time']).split(',')[0]
-            figure = f"\n\n![{caption}]({relative})\n\n*{caption} · 视频 {stamp}*\n\n"
-            selections.append(dict(chapter=chapter['title'], image=relative, time=selected['time'],
-                                   caption=caption, reason=choice.get('reason', ''), score=choice.get('score')))
-        else:
-            warn(f'第 {index + 1} 章没有清晰、相关且不重复的画面，未强行插图')
+        duration = chapter['end'] - chapter['start']
+        count = min(4, max(1, math.ceil(duration / 480)))
+        figures = []
+        for part in range(count):
+            start = chapter['start'] + duration * part / count
+            end = chapter['end'] if part + 1 == count else chapter['start'] + duration * (part + 1) / count
+            sample = dict(chapter, start=start, end=end)
+            sample.pop('visual_anchors', None)
+            if count > 1:
+                cues = [cue for cue in zh if cue['start'] < end and cue['end'] > start]
+                excerpt = ' '.join(cue['text'][:100] for cue in islice(cues, 6))
+                sample['visual_query'] = (str(chapter.get('visual_query') or chapter['title'])[:200]
+                                          + '。该区段的原字幕：' + excerpt)
+                anchors = [cue['start'] for cue in cues if start <= cue['start'] < end
+                           and re.search(r'图表|参数|实测|演示|数据|售价|架构|曲线|表格', cue['text'])]
+                if anchors:
+                    sample['visual_anchors'] = [anchors[0]] if len(anchors) == 1 else [anchors[0], anchors[-1]]
+            chapter_label = f'第 {index + 1}/{len(sections)} 章'
+            if count > 1:
+                chapter_label += f'第 {part + 1}/{count} 段'
+            chapter_progress = 89 + (index + part / count) / len(sections) * 3
+            name = f'chapter-{index + 1:02d}' + (f'-{part + 1:02d}' if count > 1 else '')
+            relative = f'image/{name}.jpg'
+            cache_key = fingerprint('frame-choice-v1', sample, body, used, visual_config, media_identity)[:24]
+            selection = _chapter_figure(folder, output, media_path, sample, body, intelligence, index, used, check,
+                                        warn, progress, chapter_label, chapter_progress, relative,
+                                        cache_dir / f'figure-{cache_key}.json')
+            if selection:
+                used.append(selection['hash'])
+                entry = selection['entry']
+                stamp = subtitles.stamp(entry['time']).split(',')[0]
+                caption = entry['caption']
+                figures.append(f"\n\n![{caption}]({entry['image']})\n\n*{caption} · 视频 {stamp}*\n\n")
+                selections.append(entry)
         opening, separator, remainder = body.partition("\n\n")
-        illustrated.append(heading + opening + figure + (separator + remainder if separator else ''))
+        illustrated.append(heading + opening + ''.join(figures) + (separator + remainder if separator else ''))
         completed = (index + 1) / len(sections)
         progress('illustrate', 89 + completed * 3, f'已完成 {index + 1}/{len(sections)} 章配图', completed * 100)
     atomic_json(folder / 'image-selections.json', selections)
-    if not summary.done():
-        progress('illustrated_summary', 92, '等待汇报摘要')
-    lead, terms = summary.result()
-    progress('illustrated_bundle', 92, '打包图文汇报')
     front = "![视频封面](image/cover.jpg)\n\n" if (output / 'image/cover.jpg').is_file() else ''
-    exports.report(output, 'illustrated', lead + front + "\n\n".join(illustrated) + terms)
-    exports.bundle(output)
+    return front + "\n\n".join(illustrated)
 
 
-def _video_output(store, job_id, folder, output, source, path, details, check, progress, shared_video, english_caption):
+def _chapter_figure(folder, output, media_path, chapter, body, intelligence, index, used, check, warn,
+                    progress, label, percent, relative, checkpoint):
+    target = output / relative
+
+    def image_variant(digest):
+        return f'{relative.removesuffix(".jpg")}-{digest[:16]}.jpg'
+
+    def valid(value):
+        if not isinstance(value, dict) or 'entry' not in value:
+            return False
+        entry = value['entry']
+        if entry is None:
+            return True
+        digest = value.get('digest')
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) or not isinstance(entry, dict):
+            return False
+        image = entry.get('image')
+        if image not in (relative, image_variant(digest)):
+            return False
+        saved_image = output / image
+        return (isinstance(entry.get('caption'), str)
+                and isinstance(entry.get('time'), (int, float)) and math.isfinite(entry['time'])
+                and type(value.get('hash')) is int and saved_image.is_file()
+                and digest == sha256(saved_image.read_bytes()).hexdigest())
+
+    saved = read_checkpoint(checkpoint, valid)
+    if saved is not None:
+        return saved['entry'] and saved
+
+    def frame_progress(value):
+        progress('illustrated_frames', percent, f'{label}抽取候选画面', value)
+
+    frame_progress(0)
+    images = media.candidates(media_path, chapter, folder / f'frames-{VERSION}', index, used, check, progress=frame_progress)
+    ranked = [dict(candidate=image, caption='原视频画面 · ' + chapter['title'], reason='清晰度与去重筛选') for image in images]
+    if images and intelligence.config.get('use_vlm', True):
+        progress('illustrated_review', percent, f'{label}按正文评选画面')
+        try:
+            ranked = intelligence.select(chapter, images, body)
+        except Exception as exc:
+            check()
+            warn(f'{label}视觉评选不可用，采用清晰度选帧：{type(exc).__name__}')
+    choice = next((entry for entry in ranked if not any(
+        (entry['candidate']['hash'] ^ other).bit_count() < 12 for other in used)), None)
+    if choice is None:
+        warn(f'{label}没有清晰、相关且不重复的画面，未强行插图')
+        if images:
+            atomic_json(checkpoint, {'entry': None})
+        return None
+    selected = choice['candidate']
+    content = Path(selected['path']).read_bytes()
+    digest = sha256(content).hexdigest()
+    if target.is_file() and sha256(target.read_bytes()).hexdigest() != digest:
+        relative = image_variant(digest)
+        target = output / relative
+    if not target.is_file():
+        atomic_bytes(target, content)
+    caption = re.sub(r"[\[\]<>\n]", "", subtitles.simplified(str(choice.get('caption') or chapter['title'])))
+    entry = dict(chapter=chapter['title'], image=relative, time=selected['time'], caption=caption,
+                 reason=choice.get('reason', ''), score=choice.get('score'))
+    result = {'entry': entry, 'hash': selected['hash'], 'digest': digest}
+    atomic_json(checkpoint, result)
+    return result
+
+
+def _video_output(store, job_id, folder, output, path, details, check, progress, shared_video, english_caption):
+    check()
     if path is None and shared_video is not None:
-        progress('download', 93, '等待共用视频下载')
-        path = shared_video.result()
+        path = shared_video()
     if path is None:
-        progress('download', 93, '等待最高画质视频下载')
-        path = _best_video(source, folder, check,
-            lambda p: progress('download', 93 + p * .02, f'最高画质视频下载 {p}%', p))
+        raise ValueError('未找到可封装的视频')
     details = details or media.probe(path)
     check_duration(details.get('format', {}).get('duration'))
     temporary = folder / 'video.partial.mp4'

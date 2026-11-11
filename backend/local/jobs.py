@@ -1,5 +1,7 @@
 import copy
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 import errno
 from itertools import count
 import json
@@ -17,7 +19,8 @@ from pathlib import Path
 
 from .config import JOBS, load, redact
 from .storage import atomic_json, open_shared_read
-from .resources import DOWNLOADS, FFMPEG, MODELS, DiskSpaceError
+from .resources import DOWNLOADS, FFMPEG, MODELS, DiskSpaceError, setting
+from .stages import ParallelSteps
 
 MODES = {"illustrated", "text", "mindmap", "subtitles", "download"}
 ACTIVE = {"uploading", "queued", "running", "cancelling"}
@@ -29,6 +32,10 @@ class Cancelled(Exception):
 
 
 class ServiceStopping(Exception):
+    pass
+
+
+class TaskCapacityError(ValueError):
     pass
 
 
@@ -68,11 +75,17 @@ class JobStore:
         self.worker = None
         self.workers = []
         self.worker_count = max(1, min(8, int(workers or os.getenv("TASK_WORKERS", "2"))))
+        self.pending_limit = setting("MAX_PENDING_TASKS", 64, high=1024)
+        self.active_limit = min(self.pending_limit, setting("MAX_ACTIVE_TASKS", max(8, self.worker_count * 4), high=64))
+        self._running_jobs = set()
+        self._deferred = deque()
+        self._receiving_uploads = 0
         self.stopping = threading.Event()
         self.owner = None
         self.history_recovered = 0
         self.history_unreadable = 0
         self._pending_writes = set()
+        self._progress_written = {}
         self._stage_pools = {}
         self._active_stages = {}
         self._stage_count = 0
@@ -137,6 +150,8 @@ class JobStore:
             raise RuntimeError("该任务目录已由另一个服务管理。请使用一个 Web 进程，通过 TASK_WORKERS 设置后台任务并发。")
 
     def start(self):
+        from .exports import recover_report_installs
+
         with self.lock:
             if any(thread.is_alive() for thread in self.workers):
                 return
@@ -146,6 +161,8 @@ class JobStore:
             self.jobs, self.paths, self.readers = {}, {}, {}
             self._pending_writes.clear()
             self._active_stages.clear()
+            self._running_jobs.clear()
+            self._deferred.clear()
             self.history_recovered = self.history_unreadable = 0
             for directory in sorted(p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')):
                 job = None
@@ -182,6 +199,7 @@ class JobStore:
                     elif job["status"] in {"running", "queued"}:
                         job.update(status="queued", stage="queued", stage_progress=None, stage_started_at=time.time(),
                                    message="服务恢复，等待继续处理")
+                    recover_report_installs(folder)
                     self._persist(job)
                 except OSError:
                     LOGGER.exception("任务已读取，但无法保存恢复状态：%s", directory)
@@ -191,13 +209,16 @@ class JobStore:
                 if job["status"] == "queued":
                     self.queue.put(job["id"])
             capacities = {'inspect': self.worker_count, 'download': DOWNLOADS.capacity, 'media': FFMPEG.capacity, 'asr': 1,
-                          'model': MODELS.capacity, 'outputs': self.worker_count}
+                          'model': MODELS.capacity, 'outputs': self.worker_count, 'video_output': FFMPEG.capacity}
             self._stage_pools = {name: ThreadPoolExecutor(count, thread_name_prefix=f'media-{name}')
                                  for name, count in capacities.items()}
             self.workers = [threading.Thread(target=self._work, name=f"media-worker-{i+1}", daemon=True) for i in range(self.worker_count)]
             self.worker = self.workers[0]
             for thread in self.workers:
                 thread.start()
+        for directory in self.root.glob('.deleted-*'):
+            if re.fullmatch(r'\.deleted-[0-9a-f]{32}', directory.name) and directory.is_dir():
+                self._purge_deleted(directory)
 
     @staticmethod
     def _read_record(path):
@@ -232,15 +253,24 @@ class JobStore:
     def update_output(self, job_id, mode, **fields):
         with self.lock:
             job = self.jobs[job_id]
-            state = job.setdefault('output_states', {}).setdefault(mode, {})
-            if fields.get('status') == 'running' and (state.get('status') != 'running' or fields.get('stage') != state.get('stage')):
-                fields['stage_started_at'] = time.time()
-            state.update(fields)
+            self._update_output_state(job, mode, fields)
             self._persist(job)
+
+    @staticmethod
+    def _update_output_state(job, mode, fields):
+        state = job.setdefault('output_states', {}).setdefault(mode, {})
+        phase_changed = fields.get('status') != state.get('status') or fields.get('stage') != state.get('stage')
+        if phase_changed and fields.get('status') in {'queued', 'running'}:
+            fields = dict(fields, stage_started_at=time.time())
+        state.update(fields)
+        return phase_changed
 
     def stop(self, timeout=15):
         with self.lock:
             self.stopping.set()
+            while self._deferred:
+                self._deferred.popleft()
+                self.queue.task_done()
         for pool in self._stage_pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
         for _ in self.workers:
@@ -273,6 +303,8 @@ class JobStore:
             raise ValueError("请选择有效的输出功能")
         job_id = uuid.uuid4().hex
         with self.lock:
+            if enqueue or upload_pending:
+                self.check_capacity()
             self.root.mkdir(parents=True, exist_ok=True)
             folder = self._new_folder(title)
             job = dict(id=job_id, title=title, modes=list(dict.fromkeys(modes)), source=copy.deepcopy(source),
@@ -293,6 +325,31 @@ class JobStore:
             if enqueue:
                 self.queue.put(job_id)
             return self.get(job_id)
+
+    def check_capacity(self):
+        with self.lock:
+            pending = self._receiving_uploads + sum(job['status'] in ACTIVE for job in self.jobs.values())
+            if pending >= self.pending_limit:
+                raise TaskCapacityError('待处理任务已达上限，请等已有任务完成后再提交')
+
+    @contextmanager
+    def upload_slot(self):
+        with self.lock:
+            self.check_capacity()
+            self._receiving_uploads += 1
+        reserved = True
+
+        def release():
+            nonlocal reserved
+            with self.lock:
+                if reserved:
+                    self._receiving_uploads -= 1
+                    reserved = False
+
+        try:
+            yield release
+        finally:
+            release()
 
     def settings(self, job_id):
         with self.lock:
@@ -368,14 +425,17 @@ class JobStore:
             self.update(job_id, title=title, custom_title=title)
             return self.get(job_id)
 
-    def progress(self, job_id, stage, percent, message, *, stage_progress=None):
+    def progress(self, job_id, stage, percent, message, *, stage_progress=None, output_updates=None):
         self.check(job_id)
         with self.lock:
             job = self.jobs[job_id]
             stage_progress = max(0, min(100, stage_progress)) if stage_progress is not None else None
             total = max(job["progress"], min(percent, 99))
-            if job.get("stage") == stage and job["progress"] == total and job.get("stage_progress") == stage_progress and job.get("message") == message:
+            if output_updates is None and job.get("stage") == stage and job["progress"] == total and job.get("stage_progress") == stage_progress and job.get("message") == message:
                 return
+            phase_changed = False
+            for mode, fields in (output_updates or {}).items():
+                phase_changed |= self._update_output_state(job, mode, fields)
             now = time.time()
             if job.get('stage') != stage or not job.get('stage_started_at'):
                 job['stage_started_at'] = now
@@ -386,7 +446,10 @@ class JobStore:
                 job["events"][-1] = event
             elif not previous or previous["message"] != message:
                 job["events"] = (job["events"] + [event])[-200:]
-            self._persist(job)
+            tick = time.monotonic()
+            if output_updates is None or phase_changed or stage_progress == 100 or tick - self._progress_written.get(job_id, -math.inf) >= 1:
+                self._persist(job)
+                self._progress_written[job_id] = tick
 
     def warn(self, job_id, message):
         with self.lock:
@@ -410,9 +473,13 @@ class JobStore:
             if job["status"] in ACTIVE:
                 self.cancelled.add(job_id)
                 self.update(job_id, status="cancelling" if job["status"] in {"running", "uploading"} else "cancelled", message="正在取消")
-                waiting = self._active_stages.get(job_id)
-                if waiting is not None:
+                for waiting in self._active_stages.get(job_id, ()):
                     waiting.cancel()
+                if job['status'] == 'queued':
+                    if job_id in self._deferred:
+                        self._deferred.remove(job_id)
+                        self.queue.task_done()
+                    self._release_job(job_id)
             return self.get(job_id)
 
     def retry(self, job_id, *, use_current_model=False):
@@ -422,12 +489,14 @@ class JobStore:
                 raise ValueError("任务仍在处理中")
             if self.needs_upload(previous):
                 raise ValueError("上传未完成，请重新上传素材")
+            self.check_capacity()
             fields = {}
             snapshot = None
             if use_current_model:
                 settings = self.settings(job_id)
                 settings.update({key: value for key, value in load().items()
-                                 if key.startswith(('llm_', 'vlm_')) or key == 'use_vlm'})
+                                 if key.startswith(('llm_', 'vlm_', 'subtitle_'))
+                                 or key in {'use_vlm', 'use_subtitle_model', 'asr_cleanup_mode'}})
                 revision = uuid.uuid4().hex
                 snapshot = self.directory(job_id) / f'model-settings-{revision}.json'
                 atomic_json(snapshot, settings, private=True)
@@ -472,12 +541,20 @@ class JobStore:
                 except OSError:
                     break
 
+    def resource_path(self, job_id, relative):
+        # Reject Windows drives, UNC paths and alternate streams before filesystem resolution.
+        parts = relative.split("/")
+        if any(part in {"", ".", ".."} for part in parts) or any(char in relative for char in "\\:\0"):
+            raise FileNotFoundError(relative)
+        folder = (self.directory(job_id) / "output").resolve()
+        path = folder.joinpath(*parts).resolve()
+        if not path.is_relative_to(folder):
+            raise FileNotFoundError(relative)
+        return path
+
     def open_resource(self, job_id, relative):
         with self.lock:
-            folder = (self.directory(job_id) / "output").resolve()
-            path = (folder / relative).resolve()
-            if not path.is_relative_to(folder):
-                raise FileNotFoundError(relative)
+            path = self.resource_path(job_id, relative)
             stream = open_shared_read(path)
             self.readers[job_id] = self.readers.get(job_id, 0) + 1
             return ResourceLease(self, job_id, stream)
@@ -488,9 +565,23 @@ class JobStore:
                 raise ValueError("请先取消任务，等待取消完成后再删除")
             if self.readers.get(job_id, 0):
                 raise ValueError("该任务的资源正在访问中，请下载结束后再删除")
-            shutil.rmtree(self.directory(job_id))
+            directory = self.root / f'.deleted-{uuid.uuid4().hex}'
+            self.directory(job_id).rename(directory)
             del self.jobs[job_id]
+            self._progress_written.pop(job_id, None)
             self.paths.pop(job_id, None); self.readers.pop(job_id, None)
+            self.cancelled.discard(job_id)
+            self._pending_writes.discard(job_id)
+        self._purge_deleted(directory)
+
+    @staticmethod
+    def _purge_deleted(directory):
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            LOGGER.warning('清理已删除的任务目录失败，将在服务重启时重试：%s', directory, exc_info=True)
 
     def artifact(self, job_id, filename, label, kind="file"):
         with self.lock:
@@ -521,8 +612,18 @@ class JobStore:
                 if isinstance(item, str):
                     future = None
                     with self.lock:
-                        if self.stopping.is_set() or self.jobs.get(job_id, {}).get('status') != 'queued':
+                        status = self.jobs.get(job_id, {}).get('status')
+                        if self.stopping.is_set() or status != 'queued':
+                            if status not in {'running', 'cancelling'}:
+                                self._release_job(job_id)
                             continue
+                        if job_id in self._deferred:
+                            continue
+                        if job_id not in self._running_jobs and len(self._running_jobs) >= self.active_limit:
+                            self._deferred.append(job_id)
+                            handed_off = True
+                            continue
+                        self._running_jobs.add(job_id)
                         self.check(job_id)
                         self.update(job_id, status='running', message='开始处理')
                     iterator = iter(steps(self, job_id))
@@ -542,11 +643,16 @@ class JobStore:
                     self.check(job_id)
                     self._stage_count += 1
                     try:
-                        running = self._stage_pools[step.queue].submit(self._run_step, job_id, step.run)
+                        if isinstance(step, ParallelSteps):
+                            futures = step.submit(lambda name, run: self._stage_pools[name].submit(run),
+                                                  lambda: self.check(job_id))
+                        else:
+                            futures = (self._stage_pools[step.queue].submit(self._run_step, job_id, step.run),)
                     except BaseException:
                         self._stage_count -= 1
                         raise
-                    self._active_stages[job_id] = running
+                    self._active_stages[job_id] = futures
+                    running = self._join_stages(futures) if isinstance(step, ParallelSteps) else futures[0]
                     running.add_done_callback(lambda done, task=job_id, continuation=iterator:
                                               self._stage_done(task, continuation, done))
                     handed_off = True
@@ -564,6 +670,23 @@ class JobStore:
         self.check(job_id)
         return run()
 
+    def _join_stages(self, futures):
+        joined = Future()
+
+        def collect(_):
+            with self.lock:
+                if not joined.done() and all(future.done() for future in futures):
+                    try:
+                        results = [future.result() for future in futures]
+                    except Exception as exc:
+                        joined.set_exception(exc)
+                    else:
+                        joined.set_result(results)
+
+        for future in futures:
+            future.add_done_callback(collect)
+        return joined
+
     def _stage_done(self, job_id, iterator, future):
         with self._stages_idle:
             try:
@@ -580,6 +703,23 @@ class JobStore:
 
     def _finish(self, job_id, exc=None):
         with self.lock:
+            try:
+                self._finish_job(job_id, exc)
+            finally:
+                self._release_job(job_id)
+
+    def _release_job(self, job_id):
+        if job_id not in self._running_jobs:
+            return
+        self._running_jobs.remove(job_id)
+        if not self.stopping.is_set() and self._deferred:
+            waiting = self._deferred.popleft()
+            self._running_jobs.add(waiting)
+            self.queue.put(waiting)
+            self.queue.task_done()
+
+    def _finish_job(self, job_id, exc):
+        with self.lock:
             if exc is None:
                 try:
                     self.check(job_id)
@@ -595,7 +735,9 @@ class JobStore:
                                   message='处理完成，可以下载')
             else:
                 self._finish_open_outputs(job_id, 'failed')
-                completed = any(value.get('status') == 'completed' for value in self.jobs[job_id].get('output_states', {}).values())
+                job = self.jobs[job_id]
+                completed = (any(value.get('status') == 'completed' for value in job.get('output_states', {}).values())
+                             or any(not artifact.get('pending') for artifact in job.get('artifacts', [])))
                 disk_full = isinstance(exc, DiskSpaceError) or getattr(exc, 'errno', None) == errno.ENOSPC
                 message = ('磁盘空间不足，请释放空间后继续处理' if disk_full else
                            '部分产物失败，已完成文件可下载，可继续处理失败项' if completed else '处理失败，可检查原因后重试')

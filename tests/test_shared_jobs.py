@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -11,10 +12,10 @@ from fastapi import FastAPI
 
 from local import config, pipeline, media, model_client
 from local.intelligence import Intelligence
-from local.jobs import JobStore
-from local.model_client import ModelLimitError
+from local.jobs import Cancelled, JobStore
+from local.model_client import ModelLimitError, ModelTimeoutError
 from local.storage import atomic_bytes
-from local.stages import Step
+from local.stages import ParallelSteps, Step
 
 
 def test_concurrent_same_name_jobs_keep_sources_settings_and_folders_separate(tmp_path, monkeypatch):
@@ -78,7 +79,8 @@ def test_two_workers_finish_after_clients_close_and_duplicate_queue_is_ignored(t
         restored.stop()
 
 
-def test_restart_resumes_queued_job_and_disallows_second_service(tmp_path, monkeypatch):
+@pytest.mark.parametrize('report_recovery_fails', [False, True])
+def test_restart_resumes_queued_job_and_disallows_second_service(tmp_path, monkeypatch, report_recovery_fails):
     jobs = JobStore(tmp_path)
     job = jobs.create(modes=['text'], source={}, options={}, title='恢复任务', enqueue=False)
     (jobs.directory(job['id'])/'saved-checkpoint').write_text('done', encoding="utf-8")
@@ -88,6 +90,10 @@ def test_restart_resumes_queued_job_and_disallows_second_service(tmp_path, monke
     def steps(store, job_id):
         yield Step('inspect', lambda: resume(store, job_id))
     monkeypatch.setattr(pipeline, 'steps', steps)
+    if report_recovery_fails:
+        def recover(_folder):
+            raise OSError('report recovery failed')
+        monkeypatch.setattr(pipeline.exports, 'recover_report_installs', recover)
     restored = JobStore(tmp_path)
     restored.start()
     try:
@@ -175,6 +181,7 @@ def test_long_planning_splits_recursively_and_keeps_global_boundaries(tmp_path):
             raise ModelLimitError('context')
         return {'title':'中文技术汇报','chapters':[{'title':'实质技术结论', 'start_id':0, 'start':0, 'end':duration}]}
     engine._plan_small = small
+    engine.chat = lambda *args, **kwargs: {'merge': False}
     progress = []
     result = engine.plan(source, 400, {}, {}, tmp_path/'plan.json', progress.append)
     assert progress[0] == 0 and progress[-1] == 1
@@ -187,6 +194,133 @@ def test_long_planning_splits_recursively_and_keeps_global_boundaries(tmp_path):
     progress.clear()
     assert engine.plan(source, 400, {}, {}, tmp_path/'plan.json', progress.append) == result
     assert len(calls) == count and progress == [1]
+
+
+def test_short_final_planning_window_accepts_two_topics_on_resume(tmp_path):
+    engine = Intelligence({}, lambda: None)
+    source = []
+    for index in range(6):
+        start = index * 487
+        source.append({'start': start, 'end': start + 480, 'text': f'第 {index + 1} 段技术说明'})
+    source += [
+        {'start': 2921, 'end': 3040, 'text': '公布全系售价'},
+        {'start': 3040, 'end': 3147, 'text': '总结车型定位'},
+    ]
+    checkpoint = tmp_path / 'plan.json'
+
+    def pause_at_tail(prompt, **kwargs):
+        if '公布全系售价' in prompt:
+            raise RuntimeError('模拟末段中断')
+        return {'title': '发布会汇报', 'chapters': [{'title': '技术说明', 'start_id': 0}]}
+
+    engine.chat = pause_at_tail
+    with pytest.raises(RuntimeError, match='模拟末段中断'):
+        engine.plan(source, 3147, {}, {}, checkpoint)
+    assert len(list(tmp_path.glob('plan-window-[0-5].json'))) == 6
+
+    requests = []
+
+    def resume_tail(prompt, **kwargs):
+        if prompt.startswith('判断两个相邻章节'):
+            return {'merge': False}
+        requests.append(prompt)
+        assert '公布全系售价' in prompt and '总结车型定位' in prompt
+        return {'title': '发布会汇报', 'chapters': [
+            {'title': '全系售价', 'start_id': 0},
+            {'title': '车型定位', 'start_id': 1},
+        ]}
+
+    engine.chat = resume_tail
+    plan = engine.plan(source, 3147, {}, {}, checkpoint)
+    assert len(requests) == 1
+    assert len(plan['chapters']) == 8
+    assert [(ch['title'], ch['start_id'], ch['start'], ch['end']) for ch in plan['chapters'][-2:]] == [
+        ('全系售价', 6, 2921, 3040), ('车型定位', 7, 3040, 3147),
+    ]
+
+
+def test_boundary_review_resumes_and_merges_only_continuing_topics(tmp_path):
+    engine = Intelligence({}, lambda: None)
+    source = [
+        {'start': 0, 'end': 480, 'text': '全系售价公布，基础版十五万元。'},
+        {'start': 480, 'end': 960, 'text': '长续航版本售价十八万元。'},
+        {'start': 960, 'end': 1160, 'text': '高配版本售价二十万元。'},
+        {'start': 1160, 'end': 1440, 'text': '车型定位面向家庭用户。'},
+        {'start': 1440, 'end': 1920, 'text': '高强度钢车身结构。'},
+    ]
+    requests = []
+    interrupted = True
+
+    def respond(prompt, **kwargs):
+        if not prompt.startswith('判断两个相邻章节'):
+            subtitles = prompt.rsplit('\n素材：', 1)[1]
+            chapters = [
+                {'title': cue['text'].split('。')[0], 'summary': cue['text'], 'points': [cue['text']], 'start_id': index}
+                for index, cue in enumerate(cue for cue in source if cue['text'] in subtitles)
+            ]
+            return {'title': '发布会汇报', 'chapters': chapters}
+        left, right = json.loads(prompt.rsplit('\n', 1)[1])
+        requests.append(right['excerpt'])
+        if right['excerpt'] == source[2]['text'] and interrupted:
+            raise Cancelled('模拟中断')
+        if right['excerpt'] == source[4]['text']:
+            assert left['excerpt'] == source[3]['text']
+            return {'merge': False}
+        assert kwargs['max_tokens'] == 512
+        return {'merge': True, 'left_quote': left['excerpt'], 'right_quote': right['excerpt']}
+
+    engine.chat = respond
+    checkpoint = tmp_path / 'plan.json'
+    with pytest.raises(Cancelled):
+        engine.plan(source, 1920, {}, {}, checkpoint)
+    assert not checkpoint.exists() and len(list(tmp_path.glob('plan-boundary-*.json'))) == 1
+
+    interrupted = False
+    plan = engine.plan(source, 1920, {}, {}, checkpoint)
+    assert requests == [source[1]['text'], source[2]['text'], source[2]['text'], source[4]['text']]
+    assert [(ch['start_id'], ch['start'], ch['end']) for ch in plan['chapters']] == [
+        (0, 0, 1160), (3, 1160, 1440), (4, 1440, 1920),
+    ]
+    assert plan['chapters'][0]['points'] == [cue['text'] for cue in source[:3]]
+    assert plan['chapters'][0]['summary'].splitlines() == [cue['text'] for cue in source[:3]]
+
+    drafted = []
+
+    def draft_part(chapter, batch, options, evidence):
+        assert batch[-1]['end'] - batch[0]['start'] <= 480
+        drafted.extend(batch)
+        return batch[0]['text']
+
+    engine._draft_small = draft_part
+    engine.draft(plan['chapters'][0], source, {})
+    assert drafted == source[:3]
+
+
+@pytest.mark.parametrize('failure', ['budget', 'unsupported_quote', 'timeout'])
+def test_boundary_review_keeps_chapters_when_evidence_or_budget_fails(tmp_path, monkeypatch, failure):
+    warnings = []
+    engine = Intelligence({'llm_context_tokens': 2048} if failure == 'budget' else {}, lambda: None,
+                          warning=warnings.append)
+    source = [{'start': n * 480, 'end': (n + 1) * 480, 'text': f'第{n}段字幕' * 100} for n in range(3)]
+    engine._plan_small = lambda batch, duration, *args: {
+        'title': '技术汇报', 'chapters': [{'title': '技术主题', 'start_id': 0, 'start': 0, 'end': duration}],
+    }
+    calls = []
+
+    def complete(config, prompt, *args):
+        calls.append(prompt)
+        if failure == 'timeout':
+            raise ModelTimeoutError()
+        assert failure == 'unsupported_quote'
+        excerpts = json.loads(prompt.rsplit('\n', 1)[1])
+        assert all(len(item['excerpt']) == 400 for item in excerpts)
+        return '{"merge":true,"left_quote":"没有出现的引文","right_quote":"另一段虚构引文"}'
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    plan = engine.plan(source, 1440, {}, {}, tmp_path / 'plan.json')
+    assert len(plan['chapters']) == 3
+    assert len(calls) == {'budget': 0, 'unsupported_quote': 2, 'timeout': 1}[failure]
+    assert warnings and all('保留原章节划分' in warning for warning in warnings)
 
 
 def test_long_drafts_split_on_limits_and_reuse_successful_parts(tmp_path):
@@ -292,6 +426,46 @@ def test_repeated_concurrent_cancellation_does_not_allow_early_deletion(tmp_path
     with pytest.raises(ValueError, match='取消完成'):
         jobs.remove(job['id'])
     assert jobs.directory(job['id']).is_dir()
+
+
+def test_cancelling_parallel_outputs_waits_for_running_branch(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path, workers=1)
+    report_busy = threading.Event()
+    video_busy = threading.Event()
+    release = threading.Event()
+    queued_report_started = threading.Event()
+
+    def block(started):
+        started.set()
+        assert release.wait(8)
+
+    def steps(store, job_id):
+        if store.get(job_id)['title'] == '长报告':
+            yield Step('outputs', lambda: block(report_busy))
+        else:
+            yield ParallelSteps((Step('outputs', queued_report_started.set),
+                                 Step('video_output', lambda: block(video_busy))))
+
+    monkeypatch.setattr(pipeline, 'steps', steps)
+    monkeypatch.setattr('local.jobs.load', lambda: {})
+    jobs.start()
+    try:
+        jobs.create(modes=['text'], source={}, options={}, title='长报告')
+        assert report_busy.wait(4)
+        task = jobs.create(modes=['text', 'download'], source={}, options={}, title='混合任务')
+        assert video_busy.wait(4)
+        assert jobs.cancel(task['id'])['status'] == 'cancelling'
+        with pytest.raises(ValueError, match='取消完成'):
+            jobs.remove(task['id'])
+        release.set()
+        deadline = time.monotonic() + 4
+        while jobs.get(task['id'])['status'] != 'cancelled':
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert not queued_report_started.is_set()
+    finally:
+        release.set()
+        jobs.stop()
 
 
 def test_cancelled_audio_extraction_is_not_reused_as_complete_audio(tmp_path, monkeypatch):

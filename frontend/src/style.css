@@ -719,8 +719,30 @@ input[type="checkbox"] {
 .output-progress-item strong { min-width: 0; flex: initial; }
 .output-progress-item small { margin-left: auto; color: #909399; }
 .output-progress-item p { margin: 6px 0 0; color: #909399; font-size: 12px; overflow-wrap: anywhere; }
-.model-budgets { margin-top: 20px; }
-.model-budgets summary { cursor: pointer; margin-bottom: 12px; }
+.model-connection { border: 0; padding: 0; margin: 0; min-width: 0; }
+.model-connection > legend { font-weight: 600; }
+.model-tabs { display: flex; flex: 1; flex-direction: column; min-height: 0; margin-top: 8px; }
+.model-tabs > .el-tabs__header { flex: none; margin-bottom: 10px; }
+.model-tabs > .el-tabs__content { flex: 1; min-height: 0; }
+.model-tabs > .el-tabs__content > .el-tab-pane { height: 100%; overflow-y: auto; padding: 2px 3px; }
+.model-tabs .el-tabs__item { padding-inline: 8px; }
+.model-tabs .muted { margin: 0 0 14px; }
+.model-radio-options { display: flex; flex-wrap: wrap; gap: 0 20px; margin-top: 8px; }
+.model-radio-options input[type="radio"] { flex: none; width: 16px; height: 16px; padding: 0; accent-color: #409eff; }
+.model-radio-options input[type="radio"]:focus-visible { outline: 2px solid #409eff; outline-offset: 2px; }
+.subtitle-cleanup { margin-top: 18px; }
+.model-capacity { margin: 4px 0 12px; line-height: 1.6; }
+.model-capacity span { color: #737780; }
+.model-test { display: flex; flex: none; align-items: center; gap: 12px; margin-top: 8px; padding-top: 10px; border-top: 1px solid #ebeef5; }
+.model-test-buttons { display: flex; flex: none; gap: 8px; margin-left: auto; }
+.model-test-result, .model-capacity { font-size: 13px; color: #606266; overflow-wrap: anywhere; }
+.model-test-result { min-width: 0; max-height: 64px; overflow: auto; }
+.model-test-result.success { color: #28773d; }
+.model-test-result.error { color: #ad2828; }
+@media (max-width: 480px) {
+  .model-tabs .el-tabs__item { font-size: 12px; padding-inline: 4px; }
+  .model-test { align-items: stretch; flex-direction: column; }
+}
 .task-controls {
   display: flex;
   gap: 20px;
@@ -920,22 +942,17 @@ input[type="checkbox"] {
   padding: 20px;
 }
 .model-dialog {
+  display: flex;
+  flex-direction: column;
   background: #fff;
   border-radius: 6px;
-  padding: 26px;
-  width: 660px;
-  max-height: 92vh;
-  overflow: auto;
+  padding: 22px 26px;
+  width: min(660px, 100%);
+  height: min(515px, calc(100dvh - 40px));
+  overflow: hidden;
   box-shadow: 0 2px 12px #0002;
 }
-.model-dialog > .muted {
-  margin: 14px 0 20px;
-}
-.model-dialog h3 {
-  margin: 22px 0 16px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid #ebeef5;
-}
+.model-dialog > .section-heading { flex: none; }
 .model-dialog label {
   display: block;
   font-size: 13px;
@@ -1151,7 +1168,16 @@ input[type="checkbox"] {
     gap: 0;
   }
   .model-dialog {
-    padding: 22px 18px;
+    padding: 16px 18px;
+    height: min(540px, calc(100dvh - 40px));
+  }
+  .model-dialog label {
+    margin-bottom: 10px;
+  }
+  .model-dialog label select,
+  .model-dialog .model-connection input:not([type="radio"]) {
+    margin-top: 5px;
+    padding-block: 8px;
   }
   .modal-footer {
     flex-direction: column;

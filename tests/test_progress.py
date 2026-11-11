@@ -48,6 +48,25 @@ def test_parallel_stages_keep_independent_start_times_and_progress(tmp_path, mon
     assert jobs.get(job['id'])['output_states']['text']['stage_started_at'] == 120
 
 
+def test_frame_progress_persists_at_stage_boundaries_and_throttles_intermediate_writes(tmp_path, monkeypatch):
+    jobs = JobStore(tmp_path)
+    job = jobs.create(modes=['illustrated'], source={}, options={}, enqueue=False)
+    tracker = OutputProgress(jobs, job['id'], job['modes'])
+    progress = tracker.for_branch('report', {'illustrated'})
+    tick = 100.0
+    writes = []
+    monkeypatch.setattr('local.jobs.time.monotonic', lambda: tick)
+    monkeypatch.setattr('local.jobs.atomic_json', lambda target, value: writes.append(target.name))
+    for sample in range(8):
+        progress('illustrated_frames', 89, '抽帧', sample * 12.5)
+    assert jobs.get(job['id'])['output_states']['illustrated']['stage_progress'] == 87.5
+    assert writes == ['task.json', 'task.backup.json']
+    tick += 1
+    progress('illustrated_frames', 89, '抽帧', 95)
+    progress('illustrated_frames', 89, '抽帧', 100)
+    assert writes == ['task.json', 'task.backup.json'] * 3
+
+
 @pytest.mark.parametrize('failure', [False, True], ids=['success', 'cancelled'])
 def test_ffmpeg_progress_handles_partial_windows_lines_and_never_completes_cancelled_work(tmp_path, monkeypatch, failure):
     values, paths = [], []

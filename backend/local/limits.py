@@ -11,12 +11,14 @@ def budget(config, visual=False):
     return max(2048, context), max(256, min(output, context // 2))
 
 
-def request_budget(config, prompt, system, requested, visual_count=0):
+def request_budget(config, prompt, system, requested, visual_count=0, *, fit_available=False):
     context, output = budget(config, bool(visual_count))
     maximum = min(requested, output)
     # Byte count is deliberately conservative for text BPEs. Reserve room for
     # message framing and vision tokens; the provider's response is authoritative.
     estimate = len((prompt + system).encode("utf-8")) + 512 + visual_count * 2048
+    if fit_available and context - estimate >= 256:
+        return min(maximum, context - estimate)
     if estimate + maximum > context:
         raise ModelLimitError("context")
     return maximum

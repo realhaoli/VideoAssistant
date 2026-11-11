@@ -5,12 +5,13 @@ import mimetypes
 import re
 import threading
 import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 
 import markdown
 
-from .storage import atomic_text, path_lock
+from .storage import atomic_json, atomic_text, path_lock, read_checkpoint, replace_file
 from .resources import reserve_disk
 
 BUNDLE_LOCK = threading.RLock()
@@ -61,10 +62,11 @@ def report_html(text, output, title="技术汇报", embedded=False):
     return page(title, content)
 
 
-def report(output, basename, text):
+def report(output, basename, text, *, images_from=None):
     safe = clean_report(text)
     write_text(output / f"{basename}.md", safe)
-    write_text(output / f"{basename}.html", report_html(safe, output, "图文汇报" if basename == "illustrated" else "文字汇报"))
+    write_text(output / f"{basename}.html",
+               report_html(safe, images_from or output, "图文汇报" if basename == "illustrated" else "文字汇报"))
 
 
 def clean_report(text):
@@ -108,6 +110,7 @@ def report_outline(plan, bodies):
     chapters = []
     for chapter, body in zip(plan["chapters"], bodies):
         points = []
+        seen = set()
         for line in body.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or re.fullmatch(r"[（）()，。、；;\s]+", line):
@@ -118,17 +121,17 @@ def report_outline(plan, bodies):
                     continue
                 candidates = ["：".join(cells[:2])]
             else:
-                candidates = [line]
+                candidates = re.split(r"[。！？]", line)
             for sentence in candidates:
                 sentence = re.sub(r"^\s*(?:[-*]|\d+[.)、])\s*", "", sentence)
                 sentence = re.sub(r"[\*`]|\[\[IMG:[^\]]+\]\]", "", sentence)
                 sentence = re.split(r"[。！？]", sentence)[0].strip()
-                if sentence and sentence not in points:
-                    points.append(sentence if len(sentence) <= 90 else sentence[:89] + "…")
-                if len(points) >= 6:
-                    break
-            if len(points) >= 6:
-                break
+                point = sentence if len(sentence) <= 90 else sentence[:89] + "…"
+                if point and point not in seen:
+                    seen.add(point)
+                    points.append(point)
+        if len(points) > 6:
+            points = [points[index * (len(points) - 1) // 5] for index in range(6)]
         chapters.append(dict(chapter, points=points))
     return dict(plan, chapters=chapters)
 
@@ -181,29 +184,31 @@ button.onclick=async()=>{button.disabled=true;status.textContent='正在导出 P
     write_text(output / "mindmap.html", content)
 
 
-def bundle(output, illustrated_only=True):
+def bundle(output, illustrated_only=True, *, images_from=None):
     """The illustrated download contains only the report and its used images."""
     output = Path(output).resolve()
-    with path_lock(output):
+    image_root = Path(images_from or output).resolve()
+    with path_lock(image_root):
         documents = [output / "illustrated.md", output / "illustrated.html"]
         if not all(p.is_file() for p in documents):
             raise ValueError("图文汇报尚未生成完整")
         referenced = set()
         for relative in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", documents[0].read_text(encoding="utf-8")):
-            path = (output / relative).resolve()
-            if not relative.startswith("image/") or not path.is_relative_to((output / "image").resolve()) or not path.is_file():
+            path = (image_root / relative).resolve()
+            if not relative.startswith("image/") or not path.is_relative_to((image_root / "image").resolve()) or not path.is_file():
                 raise ValueError(f"图文汇报图片路径无效：{relative}")
             referenced.add(path)
         temporary = output / "illustrated.zip.part"
         temporary.unlink(missing_ok=True)
-        files = documents + sorted(referenced)
-        size = sum(path.stat().st_size for path in files)
+        files = [(path, path.name) for path in documents]
+        files.extend((path, path.relative_to(image_root)) for path in sorted(referenced))
+        size = sum(path.stat().st_size for path, _ in files)
         try:
             with reserve_disk(output, size + size // 100 + 1024**2):
                 with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for path in files:
-                        archive.write(path, path.relative_to(output))
-                temporary.replace(output / "illustrated.zip")
+                    for path, relative in files:
+                        archive.write(path, relative)
+                replace_file(temporary, output / "illustrated.zip")
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -216,6 +221,64 @@ ARTIFACTS = {
     "download": [("video.mp4", "视频 MP4", "video")],
 }
 ENGLISH_SUBTITLES = ("subtitles.en.txt", "英文字幕 TXT", "text")
+
+
+def report_files(mode):
+    names = [name for name, _, _ in ARTIFACTS[mode]]
+    if mode == 'illustrated':
+        names.append('illustrated.zip')
+    return names
+
+
+def install_report(output, mode, text, lock, check):
+    staged = Path(tempfile.mkdtemp(prefix='.report-stage-', dir=output.parent))
+    journal = staged / 'install.json'
+    try:
+        report(staged, mode, text, images_from=output)
+        if mode == 'illustrated':
+            bundle(staged, images_from=output)
+        names = report_files(mode)
+        with lock:
+            check()
+            (staged / 'previous').mkdir()
+            originals = [name for name in names if (output / name).is_file()]
+            atomic_json(journal, {'mode': mode, 'originals': originals})
+            try:
+                for name in originals:
+                    replace_file(output / name, staged / 'previous' / name)
+                for name in names:
+                    replace_file(staged / name, output / name)
+                journal.unlink()
+            except BaseException:
+                _rollback_report_install(output, staged)
+                raise
+    finally:
+        if not journal.exists():
+            shutil.rmtree(staged, ignore_errors=True)
+
+
+def _rollback_report_install(output, staged):
+    journal = staged / 'install.json'
+    record = read_checkpoint(journal, lambda value: isinstance(value, dict)
+                             and value.get('mode') in {'text', 'illustrated'}
+                             and isinstance(value.get('originals'), list))
+    if record is None:
+        raise OSError('汇报安装记录无法读取')
+    for name in report_files(record['mode']):
+        old = staged / 'previous' / name
+        if old.is_file():
+            replace_file(old, output / name)
+        elif name not in record['originals']:
+            (output / name).unlink(missing_ok=True)
+    journal.unlink()
+
+
+def recover_report_installs(folder):
+    for staged in folder.glob('.report-stage-*'):
+        if staged.is_dir():
+            if (staged / 'install.json').is_file():
+                _rollback_report_install(folder / 'output', staged)
+            shutil.rmtree(staged, ignore_errors=True)
 
 
 def publish(store, job_id):

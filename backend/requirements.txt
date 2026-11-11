@@ -1,13 +1,17 @@
-fastapi==0.104.1
+fastapi==0.162.3
+starlette>=1.10,<2
 uvicorn[standard]==0.24.0
-pydantic==2.5.0
-python-multipart>=0.0.18
+pydantic==2.14.3
+python-multipart>=0.0.32,<1
 openai==1.88.0
 requests>=2.31.0
 python-json-logger==2.0.7
 python-dotenv>=1.0.0
 yt-dlp[default]>=2025.1.1
 faster-whisper>=1.1.0,<2
+# Patched HTTP transports used by Hugging Face model downloads.
+httpx2>=2.12,<3
+httpcore2>=2.10,<3
 # PyAV 16+ changes av.open keyword arguments used by faster-whisper 1.x
 av>=11,<16
 Pillow>=10.0.0

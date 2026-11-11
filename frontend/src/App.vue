@@ -5,7 +5,7 @@ import {
   onMounted,
   onBeforeUnmount,
 } from "vue";
-import { ElDialog, ElMessage, ElMessageBox, ElPagination } from "element-plus";
+import { ElDialog, ElMessage, ElMessageBox, ElPagination, ElTabs, ElTabPane } from "element-plus";
 import {
   Plus,
   Document,
@@ -23,6 +23,8 @@ import {
 } from "@element-plus/icons-vue";
 
 import { features } from "./features.js";
+import ModelConnectionFields from "./components/ModelConnectionFields.vue";
+import ModelSettingsActions from "./components/ModelSettingsActions.vue";
 import OutputModes from "./components/OutputModes.vue";
 import TaskActions from "./components/TaskActions.vue";
 
@@ -92,10 +94,12 @@ function stageLabel(state, fallbackStart) {
 }
 const stageProgressText = computed(() => {
   const task = activeTask.value;
-  const running = Object.values(task?.output_states || {}).filter(output => output.status === 'running');
-  const distinct = new Map(running.map(output => [JSON.stringify([output.stage, output.message, output.stage_progress]), output]));
+  const outputs = Object.values(task?.output_states || {});
+  const running = outputs.filter(output => output.status === 'running');
+  const visible = running.length ? running : outputs.filter(output => output.status === 'queued');
+  const distinct = new Map(visible.map(output => [JSON.stringify([output.stage, output.message, output.stage_progress]), output]));
   const stages = [...distinct.values()].map(output => stageLabel(output, task.stage_started_at || task.updated_at));
-  if (stages.length > 1) return '并行处理：' + stages.join(' / ');
+  if (stages.length > 1) return (running.length ? '并行处理：' : '') + stages.join(' / ');
   return stages[0] || stageLabel(task, task?.events?.at(-1)?.time || task?.created_at);
 });
 const statusName = (state) =>
@@ -434,36 +438,126 @@ async function openModels() {
   modelBusy.value = true;
   try {
     settings.value = await api("/settings");
-    models.value = { ...settings.value, llm_api_key: "", vlm_api_key: "" };
+    models.value = { ...settings.value, llm_api_key: "", subtitle_api_key: "", vlm_api_key: "" };
+    modelChecks.value = {};
+    capacityResults.value = {};
+    modelTab.value = "llm";
+    localRuntime.value = settings.value;
   } catch (error) {
     notifyError(error);
   } finally {
     modelBusy.value = false;
   }
 }
-async function saveModels(test = false) {
+const modelTab = ref("llm");
+const modelChecks = ref({});
+const capacityResults = ref({});
+const savingModels = ref(false);
+const localRuntime = ref(null);
+const connectionFields = ["api_format", "base_url", "model", "api_key"];
+const modelRoles = ["llm", "vlm", "subtitle"];
+
+function clearModelCheck(role) {
+  delete modelChecks.value[role];
+  delete capacityResults.value[role];
+  if (role === "llm" && !models.value.use_subtitle_model) delete modelChecks.value.subtitle;
+}
+
+function modelValues(role) {
+  const current = models.value;
+  if (role === "whisper") {
+    return { whisper_model: current.whisper_model, whisper_device: current.whisper_device };
+  }
+  const values = {};
+  if (role === "vlm") values.use_vlm = true;
+  if (role === "subtitle") {
+    values.use_subtitle_model = current.use_subtitle_model;
+    values.asr_cleanup_mode = current.asr_cleanup_mode;
+    if (!current.use_subtitle_model) return values;
+  }
+  for (const field of connectionFields) {
+    const key = role + "_" + field;
+    values[key] = current[key];
+  }
+  return values;
+}
+
+function formatTokens(value) {
+  if (!Number.isFinite(value)) return "待检测";
+  if (value >= 1_000_000) return Math.round(value / 1_000_000) + " M token";
+  if (value >= 1_000) return Math.round(value / 1_000) + " K token";
+  return value + " token";
+}
+
+function modelCapacity(role) {
+  const result = capacityResults.value[role];
+  function capacity(field) {
+    const key = role + "_" + field;
+    const value = result?.capacity[key] ?? settings.value[key];
+    const fallback = result && !Object.hasOwn(result.detected, key);
+    return formatTokens(value) + (fallback ? "（备用值）" : "");
+  }
+  return `上下文 ${capacity("context_tokens")} · 最大输出：${capacity("max_output_tokens")}`;
+}
+
+async function testModel(role) {
+  if (modelBusy.value) return;
   modelBusy.value = true;
+  modelChecks.value[role] = { state: "running", message: role === "whisper" ? "正在检测本地环境" : "正在测试连接并读取容量" };
   try {
-    settings.value = await api("/settings", {
-      method: "PUT",
-      body: JSON.stringify(models.value),
+    if (role === "whisper") {
+      const model = models.value.whisper_model;
+      const runtime = await api("/settings?whisper_model=" + encodeURIComponent(model));
+      localRuntime.value = { ...runtime, whisper_model: model };
+      modelChecks.value[role] = runtime.ffmpeg_available
+        ? { state: "success", message: "FFmpeg 就绪，" + (runtime.whisper_downloaded ? "模型已缓存" : "模型将在首次使用时下载") }
+        : { state: "error", message: "未找到 FFmpeg 或 FFprobe" };
+      return;
+    }
+    const target = role === "subtitle" && !models.value.use_subtitle_model ? "llm" : role;
+    const result = await api("/settings/test", {
+      method: "POST",
+      body: JSON.stringify({ role: target, draft: modelValues(target) }),
     });
-    // Once saved, keep only the configured status in the form. The fixed
-    // asterisks are the server's mask, never the stored key or a value to submit.
-    if (models.value) {
-      models.value.llm_api_key = "";
-      models.value.vlm_api_key = "";
+    capacityResults.value[target] = result;
+    modelChecks.value[role] = { state: "success", message: result.message };
+  } catch (error) {
+    modelChecks.value[role] = { state: "error", message: error.message || String(error) };
+  } finally {
+    modelBusy.value = false;
+  }
+}
+
+async function saveModels() {
+  if (modelBusy.value) return;
+  modelBusy.value = true;
+  savingModels.value = true;
+  try {
+    const values = Object.assign({}, ...[...modelRoles, "whisper"].map(modelValues));
+    for (const role of modelRoles) {
+      if (role === "subtitle" && !models.value.use_subtitle_model) continue;
+      Object.assign(values, capacityResults.value[role]?.detected);
     }
-    if (test) {
-      const result = await api("/settings/test", { method: "POST" });
-      ElMessage.success(result.message);
-    } else {
-      models.value = null;
-      ElMessage.success("模型配置已保存在本机");
+    const { detected_capacities, ...saved } = await api("/settings?detect_for=all", {
+      method: "PUT",
+      body: JSON.stringify(values),
+    });
+    for (const role of modelRoles) {
+      if (role === "subtitle" && !models.value.use_subtitle_model) continue;
+      if (connectionFields.some(field => field !== "api_key" && models.value[role + "_" + field] !== saved[role + "_" + field])) {
+        clearModelCheck(role);
+      }
     }
+    settings.value = { ...settings.value, ...saved };
+    models.value = { ...saved, llm_api_key: "", subtitle_api_key: "", vlm_api_key: "" };
+    capacityResults.value = Object.fromEntries(Object.entries(detected_capacities ?? {}).map(
+      ([role, detected]) => [role, { capacity: saved, detected }],
+    ));
+    ElMessage.success("全部配置已保存");
   } catch (error) {
     notifyError(error);
   } finally {
+    savingModels.value = false;
     modelBusy.value = false;
   }
 }
@@ -923,7 +1017,7 @@ onBeforeUnmount(() => {
         </button>
       </template>
     </ElDialog>
-    <div v-if="models" class="modal-backdrop" @click.self="models = null">
+    <div v-if="models" class="modal-backdrop" @click.self="!modelBusy && (models = null)">
       <section
         class="model-dialog"
         role="dialog"
@@ -935,126 +1029,105 @@ onBeforeUnmount(() => {
           <button
             class="icon-button"
             aria-label="关闭模型设置"
+            :disabled="modelBusy"
             @click="models = null"
           >
             <el-icon><Close /></el-icon>
           </button>
         </div>
-        <p class="muted">密钥留空则保留已有配置。</p>
-        <h3>大语言模型</h3>
-        <label>接口格式<select v-model="models.llm_api_format" aria-label="语言模型接口格式">
-          <option value="openai">OpenAI 兼容（Chat Completions）</option>
-          <option value="anthropic">Anthropic（Messages）</option>
-        </select></label>
-        <label
-          >接口地址<input
-            v-model="models.llm_base_url"
-            aria-label="大语言模型接口地址"
-            placeholder="https://…/v1"
-        /></label>
-        <div class="model-two">
-          <label>模型名称<input v-model="models.llm_model" aria-label="大语言模型名称" /></label
-          ><label
-            >API Key<input
-              v-model="models.llm_api_key"
-              aria-label="大语言模型 API Key"
-              type="password"
-              autocomplete="new-password"
-              :placeholder="
-                settings.llm_key_configured
-                  ? settings.llm_key_mask
-                  : '请输入 API Key'
-              "
-          /></label>
-        </div>
-        <h3>多模态模型</h3>
-        <label class="checkbox-label"
-          ><input
-            v-model="models.use_vlm"
-            type="checkbox"
-          />启用多模态选图</label
-        ><template v-if="models.use_vlm"
-          ><label>接口格式<select v-model="models.vlm_api_format" aria-label="多模态模型接口格式">
-            <option value="openai">OpenAI 兼容（Chat Completions）</option>
-            <option value="anthropic">Anthropic（Messages）</option>
-          </select></label><label
-            >接口地址<input
-              v-model="models.vlm_base_url"
-              aria-label="多模态模型接口地址"
-              placeholder="https://…/v1"
-          /></label>
-          <div class="model-two">
-            <label
-              >模型名称<input
-                v-model="models.vlm_model"
-                aria-label="多模态模型名称" /></label
-            ><label
-              >API Key<input
-                v-model="models.vlm_api_key"
-                aria-label="多模态模型 API Key"
-                type="password"
-                autocomplete="new-password"
-                :placeholder="settings.vlm_key_configured ? settings.vlm_key_mask : '请输入 API Key'"
-            /></label></div
-        ></template>
-        <details class="model-budgets"><summary>模型容量限制</summary>
-          <div class="model-two"><label>语言模型上下文（token）<input type="number" min="2048" max="2000000" v-model.number="models.llm_context_tokens" /></label><label>语言模型最大输出（token）<input type="number" min="256" max="131072" v-model.number="models.llm_max_output_tokens" /></label></div>
-          <div class="model-two"><label>多模态上下文（token）<input type="number" min="2048" max="2000000" v-model.number="models.vlm_context_tokens" /></label><label>多模态最大输出（token）<input type="number" min="256" max="131072" v-model.number="models.vlm_max_output_tokens" /></label></div>
-          <p class="device-note">1M 上下文可填 1000000；最大输出请按具体模型设置，两者并不相同。</p>
-        </details>
-        <h3>本地语音识别</h3>
-        <div class="model-two">
-          <label
-            >Whisper 模型<select v-model="models.whisper_model">
-              <option value="tiny">Tiny</option>
-              <option value="base">Base</option>
-              <option value="small">Small（默认）</option>
-              <option value="medium">Medium</option>
-              <option value="large-v3">Large-v3</option>
-              <option value="large-v3-turbo">Large-v3 Turbo</option>
-            </select></label
-          >
-          <label
-            >计算设备<select v-model="models.whisper_device">
-              <option value="auto">自动（优先 GPU）</option>
-              <option value="cpu">CPU</option>
-              <option value="cuda">GPU（CUDA）</option>
-            </select></label
-          >
-        </div>
-        <p
-          class="device-note"
-          v-if="models.whisper_device !== 'cpu' && !settings.gpu_available"
-        >
-          未检测到可用 GPU，将自动使用 CPU。
-        </p>
-        <div class="settings-runtime">
-          <span
-            >FFmpeg：{{ settings.ffmpeg_available ? "就绪" : "未安装" }}</span
-          ><span
-            >模型：{{
-              settings.whisper_downloaded &&
-              models.whisper_model === settings.whisper_model
-                ? "已缓存"
-                : "首次使用时下载"
-            }}</span
-          >
-        </div>
-        <div class="modal-footer">
-          <button
-            class="secondary"
-            :disabled="modelBusy"
-            @click="saveModels(true)"
-          >
-            {{ modelBusy ? "处理中…" : "保存并测试语言模型" }}</button
-          ><button
-            class="primary"
-            :disabled="modelBusy"
-            @click="saveModels(false)"
-          >
-            保存配置
-          </button>
-        </div>
+        <ElTabs v-model="modelTab" stretch class="model-tabs">
+          <ElTabPane label="大语言模型" name="llm" lazy>
+            <p class="muted">用于章节规划、正文整理、核对和汇报摘要。</p>
+            <ModelConnectionFields
+              v-model="models" :settings="settings" :busy="modelBusy"
+              prefix="llm" name="大语言模型" @edit="clearModelCheck('llm')"
+            />
+            <p class="model-capacity">当前模型配置：{{ modelCapacity('llm') }}<span>（点击“连接测试”更新最大容量）</span></p>
+          </ElTabPane>
+          <ElTabPane label="多模态模型" name="vlm" lazy>
+            <p class="muted">用于结合报告正文评选视频画面，为图文报告配图。</p>
+            <ModelConnectionFields
+              v-model="models" :settings="settings" :busy="modelBusy"
+              prefix="vlm" name="多模态模型" @edit="clearModelCheck('vlm')"
+            />
+            <p class="model-capacity">当前模型配置：{{ modelCapacity('vlm') }}<span>（点击“连接测试”更新最大容量）</span></p>
+          </ElTabPane>
+          <ElTabPane label="字幕模型" name="subtitle" lazy>
+            <p class="muted">字幕清洗与翻译为简单任务，可选用更快的模型处理。</p>
+            <fieldset class="model-connection" :disabled="modelBusy">
+              <legend>模型配置</legend>
+              <div class="model-radio-options">
+                <label class="checkbox-label">
+                  <input v-model="models.use_subtitle_model" type="radio" name="subtitle-profile" :value="false" @change="clearModelCheck('subtitle')" />继承大语言模型
+                </label>
+                <label class="checkbox-label">
+                  <input v-model="models.use_subtitle_model" type="radio" name="subtitle-profile" :value="true" @change="clearModelCheck('subtitle')" />独立配置模型
+                </label>
+              </div>
+            </fieldset>
+            <p v-if="!models.use_subtitle_model" class="model-capacity">
+              {{ models.llm_model ? "当前继承模型 " + models.llm_model : "当前继承大语言模型" }}，{{ modelCapacity('llm') }}
+            </p>
+            <template v-else>
+              <ModelConnectionFields
+                v-model="models" :settings="settings" :busy="modelBusy"
+                prefix="subtitle" name="字幕模型" @edit="clearModelCheck('subtitle')"
+              />
+              <p class="model-capacity">当前模型配置：{{ modelCapacity('subtitle') }}<span>（点击“连接测试”更新最大容量）</span></p>
+            </template>
+            <fieldset class="model-connection subtitle-cleanup" :disabled="modelBusy">
+              <legend>如何清洗字幕</legend>
+              <div class="model-radio-options">
+                <label class="checkbox-label">
+                  <input v-model="models.asr_cleanup_mode" type="radio" name="subtitle-cleanup" value="local" />使用本地规则（速度更快但准确性可能不足）
+                </label>
+                <label class="checkbox-label">
+                  <input v-model="models.asr_cleanup_mode" type="radio" name="subtitle-cleanup" value="model" />大模型清洗（准确性更高但速度更慢）
+                </label>
+              </div>
+            </fieldset>
+          </ElTabPane>
+          <ElTabPane label="本地语音识别" name="whisper" lazy>
+            <p class="muted">用于在缺少可用字幕时，将音视频中的语音转写为字幕。</p>
+            <div class="model-two">
+              <label>Whisper 模型
+                <select v-model="models.whisper_model" :disabled="modelBusy" @change="clearModelCheck('whisper')">
+                  <option value="tiny">Tiny（参数量：39M · 权重：75.5 MB）</option>
+                  <option value="base">Base（参数量：74M · 权重：145 MB）</option>
+                  <option value="small">Small（参数量：244M · 权重：484 MB）</option>
+                  <option value="medium">Medium（参数量：769M · 权重：1.53 GB）</option>
+                  <option value="large-v3">Large-v3（参数量：1550M · 权重：3.09 GB）</option>
+                  <option value="large-v3-turbo">Large-v3 Turbo（参数量：809M · 权重：1.62 GB）</option>
+                </select>
+              </label>
+              <label>计算设备
+                <select v-model="models.whisper_device" :disabled="modelBusy" @change="clearModelCheck('whisper')">
+                  <option value="auto">自动</option>
+                  <option value="cuda">GPU</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </label>
+            </div>
+            <p v-if="models.whisper_device !== 'cpu' && !localRuntime.gpu_available" class="device-note">
+              未检测到可用 GPU，将自动使用 CPU。
+            </p>
+            <div class="settings-runtime">
+              <span>FFmpeg：{{ localRuntime.ffmpeg_available ? "就绪" : "未安装" }}</span>
+              <span>模型：{{
+                models.whisper_model !== localRuntime.whisper_model ? "待检测" :
+                  localRuntime.whisper_downloaded ? "已缓存" : "首次使用时下载"
+              }}</span>
+            </div>
+          </ElTabPane>
+        </ElTabs>
+        <ModelSettingsActions
+          :busy="modelBusy"
+          :saving="savingModels"
+          :result="modelChecks[modelTab]"
+          :test-label="modelTab === 'whisper' ? '环境检测' : '连接测试'"
+          @test="testModel(modelTab)"
+          @save="saveModels"
+        />
       </section>
     </div>
 

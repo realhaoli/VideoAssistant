@@ -1,3 +1,4 @@
+from contextlib import suppress
 import json
 from functools import partial
 import hashlib
@@ -246,10 +247,33 @@ def _download(url, folder, *, best, audio, check, progress, resource_id):
             elif event.get('status') == 'finished':
                 disk.resize(0)
 
+        def merge(inputs, destination, options):
+            target = Path(destination)
+            budget = sum(Path(name).stat().st_size for name in inputs)
+            args = ['ffmpeg', '-y', '-v', 'error']
+            for name in inputs:
+                args.extend(['-i', 'file:' + str(name)])
+            args.extend([*options, '-movflags', '+faststart', 'file:' + str(target)])
+
+            def check_merge():
+                check()
+                written = target.stat().st_size if target.is_file() else 0
+                disk.resize(max(budget - written, 4 * 1024**2))
+                ensure_disk(folder)
+
+            check_merge()
+            try:
+                ffmpeg_command(args, check_merge)
+            except BaseException:
+                with suppress(OSError):
+                    target.unlink(missing_ok=True)
+                raise
+
         opts['progress_hooks'] = [hook]
         opts['postprocessor_hooks'] = [postprocess]
         opts['postprocessor_args'] = {'ffmpeg':['-threads',str(setting('FFMPEG_THREADS',2,high=16))]}
         with LinkDownloader(opts, resource_id=resource_id) as ydl:
+            ydl.merge_runner = merge
             ydl.download([url])
     check()
     files = [p for p in completed_files() if valid(p)]
@@ -558,9 +582,8 @@ def candidates(path, chapter, output, index, used, check, *, progress=None):
     start, end = chapter["start"], chapter["end"]
     duration = max(.1, end - start)
     def extract(item):
-        n, fraction = item
+        n, timestamp = item
         check()
-        timestamp = min(end - .08, start + duration * fraction)
         # Chapter boundaries can change after prompt edits. Include the actual
         # frame timestamp so a resumed task never relabels an old screenshot.
         target = output / "images" / f"chapter-{index + 1:02d}-{n + 1}-{round(timestamp * 1000)}.jpg"
@@ -574,7 +597,15 @@ def candidates(path, chapter, output, index, used, check, *, progress=None):
             return dict(path=target, time=timestamp, quality=quality, hash=fingerprint, duplicate=duplicate)
         except (RuntimeError, ValueError):
             return None
-    samples = (.04, .17, .30, .43, .56, .69, .82, .94)
+    latest = max(start, end - .08)
+    samples = [min(latest, start + duration * fraction) for fraction in (.04, .17, .30, .43, .56, .69, .82, .94)]
+    available = set(range(len(samples)))
+    for anchor in chapter.get('visual_anchors', [])[:2]:
+        timestamp = min(latest, anchor + .5)
+        nearest = min(available, key=lambda index: (abs(samples[index] - timestamp), index))
+        samples[nearest] = timestamp
+        available.remove(nearest)
+    samples.sort()
     images = [None] * len(samples)
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(extract, (n, fraction)): n for n, fraction in enumerate(samples)}

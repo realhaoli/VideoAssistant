@@ -95,6 +95,10 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
             assert (await client.get('/api/v1/tasks')).status_code == 200
             assert not client.cookies
+            invalid = await client.post('/api/v1/tasks/upload', data={'modes': 'x' * 65536},
+                                        files={'file': ('lecture.mp4', b'media-data')})
+            assert invalid.status_code == 400
+            assert not jobs.list()
             response = await client.post('/api/v1/tasks/upload', data={'modes':'["text"]','options':'{}'}, files={'file':('lecture.mp4',b'media-data','video/mp4')})
             assert response.status_code == 202
             task = response.json()
@@ -107,6 +111,13 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
             assert result.status_code == 200 and result.text == '测试中文结果'
             assert (await client.get(f"/api/v1/tasks/{task['id']}/files/%2e%2e/task.json")).status_code == 404
             assert (await client.get(f"/api/v1/tasks/{task['id']}/files/source.mp4")).status_code == 404
+            assert (await client.get(f"/api/v1/tasks/{task['id']}/files/%5C%5Cserver%5Cshare%5Cfile")).status_code == 404
+            address = f"/api/v1/tasks/{task['id']}/files/report.txt"
+            partial = await client.get(address, headers={'Range': 'bytes=0-2'})
+            assert partial.status_code == 206 and partial.content == '测'.encode('utf-8')
+            invalid = await client.get(address, headers={'Range': f"bytes={'1' * 5000}-"})
+            assert invalid.status_code == 416
+            assert jobs.readers[task['id']] == 0
     asyncio.run(exercise())
 
 
@@ -352,6 +363,7 @@ def test_offline_mindmap_uses_original_renderer_and_escapes_data(tmp_path):
 
 def test_mindmap_pdf_is_the_only_public_map_file(tmp_path, monkeypatch):
     from fastapi import FastAPI
+    from local.uploads import PDF_UPLOAD_LIMIT, UploadLimits
     from routers import tasks
     jobs = JobStore(tmp_path)
     task = jobs.create(modes=['mindmap'], source={'type': 'upload'}, options={}, enqueue=False)
@@ -361,10 +373,13 @@ def test_mindmap_pdf_is_the_only_public_map_file(tmp_path, monkeypatch):
     (output.parent / 'mindmap.json').write_text('{}', encoding="utf-8")
     monkeypatch.setattr(tasks, 'store', jobs)
     app = FastAPI()
+    app.add_middleware(UploadLimits)
     app.include_router(tasks.router)
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             address = f"/api/v1/tasks/{task['id']}/mindmap/pdf"
+            oversized = await client.post(address, content=b'', headers={'Content-Length': str(PDF_UPLOAD_LIMIT + 2 * 1024**2)})
+            assert oversized.status_code == 413
             assert (await client.post(address, files={'file': ('bad.pdf', b'not a pdf')})).status_code == 400
             content = b'%PDF-1.7\n test\n%%EOF\n'
             assert (await client.post(address, files={'file': ('mindmap.pdf', content)})).status_code == 200
@@ -518,6 +533,80 @@ def test_model_json_with_trailing_text_or_second_object():
     from local.intelligence import decode
     assert decode('```json\n{"facts":[{"text":"续航12小时","quote":"续航12小时"}]}\n```\n<｜hy_Assistant｜>') == {'facts':[{'text':'续航12小时','quote':'续航12小时'}]}
     assert decode('{"one_sentence":"结论"}\n{"explanation":"多余对象"}') == {'one_sentence':'结论'}
+
+
+@pytest.mark.parametrize('first_response', ['length', '{"', '{"chapters":[{"title":"半截"}'])
+@pytest.mark.parametrize('output_limit, retry_limit', [(8192, 8192), (16384, 16384), (32768, 16384)])
+def test_chapter_planning_retries_incomplete_response_within_configured_budget(
+    tmp_path, monkeypatch, first_response, output_limit, retry_limit,
+):
+    from local import model_client
+
+    requests = []
+
+    def complete(config, prompt, system, visual, maximum, check):
+        requests.append(maximum)
+        if len(requests) == 1:
+            if first_response == 'length':
+                raise model_client.ModelLimitError('output')
+            return first_response
+        return '{"title":"电池技术","chapters":[{"title":"技术规格","start_id":0}]}'
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    engine = Intelligence({'llm_context_tokens': 1_000_000, 'llm_max_output_tokens': output_limit}, lambda: None)
+    cues = [{'start': 0, 'end': 10, 'text': '容量100kWh。'}]
+    path = tmp_path / 'plan.json'
+    plan = engine.plan(cues, 10, {}, {}, path)
+    assert requests == [6000, retry_limit]
+    assert plan['chapters'][0]['start_quote'] == cues[0]['text']
+    assert json.loads(path.read_text(encoding='utf-8')) == plan
+
+
+def test_structured_output_retry_fits_remaining_context(monkeypatch):
+    from local import model_client
+
+    requests = []
+
+    def complete(config, prompt, system, visual, maximum, check):
+        requests.append(maximum)
+        if len(requests) == 1:
+            raise model_client.ModelLimitError('output')
+        return '{"result":true}'
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    engine = Intelligence({'llm_context_tokens': 8192}, lambda: None)
+    value = engine.report_json('测试', 'x' * 5000, lambda data: 'result' in data, system='s', max_tokens=1200)
+    assert value == {'result': True}
+    assert requests == [1200, 8192 - 5000 - 1 - 512]
+
+
+def test_truncated_chapter_json_without_finish_reason_gets_one_smaller_window_retry(tmp_path, monkeypatch):
+    from local import model_client
+
+    attempts = []
+
+    def complete(config, prompt, system, visual, maximum, check):
+        if prompt.startswith('判断两个相邻章节'):
+            return '{"merge":false}'
+        material = prompt.rsplit('\n素材：', 1)[1]
+        attempts.append(maximum)
+        if '前段' in material and '后段' in material:
+            return '{"chapters":[{"title":"未闭合","start_id":0}'
+        return '{"title":"技术报告","chapters":[{"title":"章节","start_id":0}]}'
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    engine = Intelligence({'llm_context_tokens': 1_000_000, 'llm_max_output_tokens': 16384}, lambda: None)
+    cues = [{'start': 0, 'end': 200, 'text': '前段'}, {'start': 200, 'end': 400, 'text': '后段'}]
+    plan = engine.plan(cues, 400, {}, {}, tmp_path / 'plan.json')
+    assert attempts == [6000, 16384, 6000, 6000]
+    assert [(chapter['start'], chapter['end']) for chapter in plan['chapters']] == [(0, 200), (200, 400)]
+
+
+def test_mindmap_points_cover_the_end_of_a_long_chapter():
+    plan = {'title':'技术汇报', 'chapters':[{'title':'车型规格'}]}
+    body = '。'.join([*(f'第 {index} 条已核查事实' for index in range(18)), '尾段公布交付时间。'])
+    points = exports.report_outline(plan, [body])['chapters'][0]['points']
+    assert len(points) == 6 and points[-1] == '尾段公布交付时间'
 
 
 def test_technical_body_does_not_invent_test_methods_and_map_uses_final_facts():
