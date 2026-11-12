@@ -289,6 +289,8 @@ def test_whisper_gpu_runtime_failure_restarts_on_cpu_without_duplicate_cues(tmp_
         stream=broken if device=='cuda' else lambda:iter([segment('CPU 完整结果')])
         return SimpleNamespace(transcribe=lambda *args, **kwargs:(stream(),SimpleNamespace(duration=1,language='zh')))
     monkeypatch.setattr(media,'_load_whisper',load)
+    monkeypatch.setattr(media.CUDA_WHISPER, 'recognize', lambda audio, name, check, progress:
+                        (*media._recognize_whisper(audio, name, 'cuda', check, progress), {}))
     messages=[]
     result,_=media.transcribe(tmp_path/'source.mp4',tmp_path,lambda:None,lambda n:None,settings={'whisper_model':'small','whisper_device':'auto'},warning=messages.append)
     assert devices == ['cuda','cpu']

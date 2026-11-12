@@ -17,11 +17,13 @@ from .links import LinkDownloader, describe_resource
 from .resources import ASR, DOWNLOADS, FFMPEG, FRAMES, ensure_disk, reserve_disk, setting
 from .stages import Step, drive
 from .storage import atomic_json, atomic_text
+from .whisper_worker import CudaWhisper, CudaWhisperTimeout, probe_cuda
 
 MODEL_LOCK = threading.Lock()
 MODEL = None
 MODEL_KEY = None
 WHISPER_RUNTIME = {}
+CUDA_WHISPER = CudaWhisper()
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4v"}
 TEXT_SUBTITLE_CODECS = {"subrip", "ass", "webvtt", "mov_text", "text", "ssa"}
 CAPTION_SCAN_VERSION = 1
@@ -330,11 +332,8 @@ def embedded_subtitles(path, folder, check, warning, streams):
 
 
 def cuda_available():
-    try:
-        import ctranslate2
-        return ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        return False
+    now = time.monotonic()
+    return now >= CUDA_WHISPER.retry_after and probe_cuda(int(now // 60))
 
 
 def whisper_status(model_name="small"):
@@ -459,7 +458,7 @@ def _chunk_steps(path, folder, check, progress, settings, warning, phase, durati
                         aligned.append(cue)
             saved = {'segments':aligned, 'language':language, 'start':start, 'end':end, 'runtime':runtime}
             atomic_json(record, saved)
-            if runtime.get('device') == 'cpu' and actual_settings.get('whisper_device') != 'cpu' and cuda_available():
+            if runtime.get('device') == 'cpu':
                 actual_settings['whisper_device'] = 'cpu'
         (root / f'{index:05}' / 'audio.wav').unlink(missing_ok=True)
         result.extend(saved['segments'])
@@ -474,6 +473,7 @@ def _chunk_steps(path, folder, check, progress, settings, warning, phase, durati
 
 
 def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda message: None, phase=None, duration=None, allow_empty=False):
+    global MODEL, MODEL_KEY, WHISPER_RUNTIME
     settings = settings or {}
     model_name = settings.get("whisper_model", "small")
     requested = settings.get("whisper_device", "auto")
@@ -494,44 +494,55 @@ def _transcribe(path, folder, check, progress, *, settings=None, warning=lambda 
             temporary_audio.unlink(missing_ok=True)
     check()
     device = "cuda" if requested != "cpu" and cuda_available() else "cpu"
-    if requested == "cuda" and device == "cpu":
+    if requested != "cpu" and device == "cpu" and time.monotonic() < CUDA_WHISPER.retry_after:
+        warning("GPU 转写超时后暂不可用，Whisper 本次使用 CPU")
+    elif requested == "cuda" and device == "cpu":
         warning("未检测到可用 GPU，Whisper 已自动切换为 CPU")
 
-    def recognize(actual_device):
-        check()
+    if device == "cuda":
         if phase:
             phase("model", None)
-        model = _load_whisper(model_name, actual_device)
-        progress(0)
-        stream, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, language=None, word_timestamps=True)
-        result = []
-        last = 0
-        for segment in stream:
-            check()
-            text = segment.text.strip()
-            if text:
-                words = getattr(segment, "words", None)
-                result.extend(word_cues(words) if words else [dict(start=segment.start, end=segment.end, text=text)])
-            percent = max(last, min(99, int(segment.end / max(info.duration, .001) * 100)))
-            if percent > last:
-                progress(percent)
-                last = percent
-        return result, info
-
-    try:
-        result, info = recognize(device)
-    except Exception:
-        check()  # Cancellation is never converted into a CPU retry.
-        if device != "cuda":
-            raise
-        warning("GPU 转写失败，Whisper 已自动切换为 CPU 重新转写")
-        result, info = recognize("cpu")
-        device = "cpu"
+        with MODEL_LOCK:
+            MODEL = MODEL_KEY = None
+        try:
+            result, language, WHISPER_RUNTIME = CUDA_WHISPER.recognize(audio, model_name, check, progress)
+        except Exception as exc:
+            check()  # Cancellation is never converted into a CPU retry.
+            reason = str(exc) if isinstance(exc, CudaWhisperTimeout) else "GPU 转写失败"
+            warning(f"{reason}，Whisper 已自动切换为 CPU 重新转写")
+            device = "cpu"
+    if device == "cpu":
+        with suppress(OSError):
+            CUDA_WHISPER.close()
+        if phase:
+            phase("model", None)
+        result, language = _recognize_whisper(audio, model_name, "cpu", check, progress)
+    check()
     if not result and not allow_empty:
         raise ValueError("未识别到有效语音，请检查音轨；静音视频无法自动生成字幕")
-    from .storage import atomic_json
     atomic_json(folder / "whisper-runtime.json", {"model": model_name, "device": device})
     progress(100)
+    return result, language
+
+
+def _recognize_whisper(audio, model_name, device, check, progress, ready=lambda: None):
+    check()
+    model = _load_whisper(model_name, device)
+    ready()
+    progress(0)
+    stream, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, language=None, word_timestamps=True)
+    result = []
+    last = 0
+    for segment in stream:
+        check()
+        text = segment.text.strip()
+        if text:
+            words = getattr(segment, "words", None)
+            result.extend(word_cues(words) if words else [dict(start=segment.start, end=segment.end, text=text)])
+        percent = max(last, min(99, int(segment.end / max(info.duration, .001) * 100)))
+        if percent > last:
+            progress(percent)
+            last = percent
     return result, info.language
 
 

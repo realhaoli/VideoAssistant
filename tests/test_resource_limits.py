@@ -16,7 +16,7 @@ import httpx
 from PIL import Image
 import pytest
 
-from local import media, model_client, pdf_export
+from local import media, model_client, pdf_export, whisper_worker
 from local.intelligence import Intelligence
 from local.jobs import Cancelled
 from local.limits import request_budget
@@ -109,11 +109,96 @@ def test_gpu_initialization_failure_still_runs_on_cpu(tmp_path, monkeypatch):
         segment=SimpleNamespace(start=0,end=5,text='CPU 结果',words=None)
         return SimpleNamespace(transcribe=lambda *args,**kwargs:(iter([segment]),SimpleNamespace(duration=5,language='zh')))
     monkeypatch.setattr(media,'_load_whisper',load)
+    monkeypatch.setattr(media.CUDA_WHISPER, 'recognize', lambda audio, name, check, progress:
+                        (*media._recognize_whisper(audio, name, 'cuda', check, progress), {}))
     result,_=media.transcribe(tmp_path/'source.mp4',tmp_path,lambda:None,lambda _:None,
         settings={'whisper_device':'cuda'},warning=warnings.append)
     assert devices==['cuda','cpu'] and result[0]['text']=='CPU 结果'
     assert json.loads((tmp_path/'whisper-runtime.json').read_text(encoding='utf-8'))['device']=='cpu'
     assert any('CPU' in message for message in warnings)
+
+
+def _cuda_fixture_worker(pipe):
+    """Replace only the native model inside a real spawned worker."""
+    def load(name, device):
+        if name == 'base':
+            time.sleep(120)
+
+        def segments():
+            yield SimpleNamespace(start=0, end=5, text='GPU 结果', words=None)
+            if name == 'medium':
+                time.sleep(120)
+
+        def transcribe(*args, **kwargs):
+            if name == 'small':
+                time.sleep(120)
+            return segments(), SimpleNamespace(duration=10, language='zh')
+
+        return SimpleNamespace(transcribe=transcribe)
+
+    media._load_whisper = load
+    whisper_worker._serve(pipe)
+
+
+@pytest.fixture
+def cuda_worker(monkeypatch):
+    worker = whisper_worker.CudaWhisper()
+    monkeypatch.setattr(whisper_worker, '_serve', _cuda_fixture_worker)
+    monkeypatch.setattr(media, 'CUDA_WHISPER', worker)
+    monkeypatch.setattr(media, 'probe_cuda', lambda interval: True)
+    monkeypatch.setenv('WHISPER_GPU_LOAD_TIMEOUT_SECONDS', '5')
+    monkeypatch.setenv('WHISPER_GPU_STALL_TIMEOUT_SECONDS', '1')
+    try:
+        yield worker
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize('model,phase', [('base', '加载'), ('small', '转写'), ('medium', '转写')])
+def test_native_gpu_stall_ends_child_and_retries_same_audio_on_cpu(tmp_path, monkeypatch, cuda_worker, model, phase):
+    audio = tmp_path / 'audio.wav'
+    audio.write_bytes(b'cached audio')
+    if phase == '加载':
+        monkeypatch.setenv('WHISPER_GPU_LOAD_TIMEOUT_SECONDS', '2')
+    calls, warnings, percentages = [], [], []
+
+    def cpu_load(name, device):
+        calls.append((name, device))
+        assert cuda_worker.process is None
+        assert audio.read_bytes() == b'cached audio'
+        segment = SimpleNamespace(start=0, end=8, text='CPU 结果', words=None)
+        return SimpleNamespace(transcribe=lambda *a, **kw: (iter([segment]), SimpleNamespace(duration=10, language='zh')))
+
+    monkeypatch.setattr(media, '_load_whisper', cpu_load)
+    result, language = media.transcribe(None, tmp_path, lambda: None, percentages.append,
+        settings={'whisper_device': 'cuda', 'whisper_model': model}, warning=warnings.append)
+    assert calls == [(model, 'cpu')]
+    assert result == [{'start': 0, 'end': 8, 'text': 'CPU 结果'}] and language == 'zh'
+    assert any(f'GPU {phase}无进展超时' in warning for warning in warnings)
+    assert percentages.count(100) == 1
+    assert not media.cuda_available()
+    assert json.loads((tmp_path / 'whisper-runtime.json').read_text(encoding='utf-8'))['device'] == 'cpu'
+
+
+def test_gpu_worker_is_reused_and_cancellation_releases_asr_slot(tmp_path, cuda_worker):
+    (tmp_path / 'audio.wav').write_bytes(b'cached audio')
+    run = lambda name, check, progress: media.transcribe(None, tmp_path, check, progress,
+        settings={'whisper_device': 'cuda', 'whisper_model': name})
+    assert run('tiny', lambda: None, lambda p: None)[0][0]['text'] == 'GPU 结果'
+    pid = cuda_worker.process.pid
+    run('tiny', lambda: None, lambda p: None)
+    assert cuda_worker.process.pid == pid
+
+    progress = []
+    def check():
+        if progress:
+            raise Cancelled('cancelled during GPU inference')
+    with pytest.raises(Cancelled):
+        run('small', check, progress.append)
+    assert cuda_worker.process is None
+    assert media.ASR.active == 0
+    assert media.cuda_available()
+    assert run('tiny', lambda: None, lambda p: None)[0][0]['text'] == 'GPU 结果'
 
 
 def test_silent_chunk_is_checkpointed_without_failing_voiced_chunks(tmp_path,monkeypatch):

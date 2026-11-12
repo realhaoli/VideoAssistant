@@ -271,6 +271,8 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 
 `WHISPER_DEVICE=auto` 优先 CUDA；显卡不可用、CUDA 初始化失败、精度不支持或推理失败时自动切回 CPU，即使设置为 `cuda` 也保留兜底。长任务一次回退后，本次运行后续分块直接使用 CPU，避免每块重复触发 GPU 错误。新一次继续任务可重新尝试修复后的 GPU。也可显式选择 `cpu`。当前 faster-whisper 的 GPU 依赖 CUDA 12 / cuDNN 9，安装说明以 [faster-whisper 官方文档](https://github.com/SYSTRAN/faster-whisper#gpu) 为准；没有对应运行库时仍可使用 CPU。
 
+CUDA 模型在独立进程中加载和转写。模型加载含首次下载，默认最多等待 30 分钟（`WHISPER_GPU_LOAD_TIMEOUT_SECONDS`）；加载后，语言检测或转写连续 180 秒无进度（`WHISPER_GPU_STALL_TIMEOUT_SECONDS`）时结束 GPU 进程，复用当前音频改用 CPU。超时后服务会暂停尝试 GPU 5 分钟，已完成的转写分块可继续复用。
+
 ### 长视频容量与断点
 
 超过 5 分钟的转写默认切成 300 秒音频块，边缘额外读取 2 秒重叠，按原始时间轴归并。每块完成即保存，随后删除该块临时 WAV；两小时素材约 24 个块，无需一次展开整段音频。中断仅重做当前未完成块；检查点损坏时仅重做损坏块。按素材指纹、模型和分块设置区分缓存，修改这些条件会新建检查点。
