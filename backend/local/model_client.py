@@ -4,16 +4,28 @@ import io
 import json
 import os
 import re
+import time
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
-from openai import APITimeoutError, APIStatusError, OpenAI, Timeout
+from openai import APIConnectionError, APITimeoutError, APIStatusError, OpenAI, Timeout
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import ReadTimeoutError
 from urllib3.util.retry import Retry
 
 from .config import MAX_MODEL_TOKENS
 from .resources import setting
+
+DEFAULT_MODEL_TIMEOUT_SECONDS = 240
+MAX_MODEL_TIMEOUT_SECONDS = 600
+
+
+def model_read_timeout():
+    return setting("MODEL_TIMEOUT_SECONDS", DEFAULT_MODEL_TIMEOUT_SECONDS, low=15, high=MAX_MODEL_TIMEOUT_SECONDS)
+
+
+def extended_read_timeout(timeout):
+    return min(MAX_MODEL_TIMEOUT_SECONDS, (timeout * 3 + 1) // 2)
 
 
 class ModelLimitError(ValueError):
@@ -24,8 +36,10 @@ class ModelLimitError(ValueError):
 
 
 class ModelTimeoutError(TimeoutError):
-    def __init__(self):
-        super().__init__("等待模型接口响应超时，已完成的检查点可在继续处理时复用")
+    def __init__(self, stage=None):
+        self.stage = stage
+        prefix = f"{stage}时" if stage else ""
+        super().__init__(f"{prefix}等待模型接口响应超时，已完成的检查点可在继续处理时复用")
 
 
 def context_error(value):
@@ -145,7 +159,7 @@ def discover_model_limits(config, *, visual=False):
     return detected
 
 
-def complete(config, prompt, system, visual, max_tokens, check):
+def complete(config, prompt, system, visual, max_tokens, check, *, read_timeout=None):
     selected = connection(config, bool(visual))
     if not selected["key"] or not selected["model"] or not selected["url"]:
         raise ValueError("请在模型设置中配置接口地址、模型名和 API Key")
@@ -158,14 +172,16 @@ def complete(config, prompt, system, visual, max_tokens, check):
     maximum_bytes = int(os.getenv("MODEL_REQUEST_MB", "16")) * 1024**2
     if len((prompt + system).encode('utf-8')) + sum(len(data) for _, data in images) + 4096 > maximum_bytes:
         raise ModelLimitError("payload")
-    timeout = setting('MODEL_TIMEOUT_SECONDS', 150, low=15, high=600)
+    timeout = model_read_timeout() if read_timeout is None else read_timeout
     if selected["format"] == "anthropic":
         content = [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}} for mime, data in images]
         content.append({"type": "text", "text": prompt})
         payload = {"model": selected["model"], "max_tokens": max_tokens, "system": system,
                    "messages": [{"role": "user", "content": content if images else prompt}]}
         with requests.Session() as session:
-            session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods={"POST"})))
+            retries = Retry(total=1, connect=0, read=0, backoff_factor=1,
+                            status_forcelist=[429, 500, 502, 503, 504], allowed_methods={"POST"})
+            session.mount("https://", HTTPAdapter(max_retries=retries))
             try:
                 response = session.post(base_url(selected["url"], "anthropic") + "/messages", json=payload,
                     headers={"x-api-key": selected["key"], "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
@@ -193,17 +209,26 @@ def complete(config, prompt, system, visual, max_tokens, check):
         # accept their default sampling policy.
         sampling = {"temperature": .15} if selected["model"].lower().startswith("hy-") else {}
         with OpenAI(api_key=selected["key"], base_url=base_url(selected["url"], "openai"),
-                    timeout=Timeout(timeout, connect=15), max_retries=1) as client:
-            try:
-                response = client.chat.completions.create(model=selected["model"], messages=[{"role": "system", "content": system},
-                                                            {"role": "user", "content": content if images else prompt}], max_tokens=max_tokens, **sampling)
-            except APITimeoutError as exc:
-                raise ModelTimeoutError() from exc
-            except APIStatusError as exc:
-                error = limit_error(str(exc), exc.status_code)
-                if error:
-                    raise error from exc
-                raise
+                    timeout=Timeout(timeout, connect=15), max_retries=0) as client:
+            for attempt in range(2):
+                check()
+                try:
+                    response = client.chat.completions.create(
+                        model=selected["model"], messages=[{"role": "system", "content": system},
+                        {"role": "user", "content": content if images else prompt}], max_tokens=max_tokens, **sampling)
+                    break
+                except APITimeoutError as exc:
+                    raise ModelTimeoutError() from exc
+                except APIStatusError as exc:
+                    error = limit_error(str(exc), exc.status_code)
+                    if error:
+                        raise error from exc
+                    if attempt or not (exc.status_code in {408, 409, 429} or exc.status_code >= 500):
+                        raise
+                except APIConnectionError:
+                    if attempt:
+                        raise
+                time.sleep(.5)
         if response.choices[0].finish_reason == "length":
             raise ModelLimitError("output")
         result = response.choices[0].message.content

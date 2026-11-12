@@ -655,6 +655,7 @@ def test_model_read_timeout_is_configurable_and_actionable(monkeypatch, protocol
         def __init__(self, **kwargs):
             if protocol == 'openai':
                 assert kwargs['timeout'].read == 210 and kwargs['timeout'].connect == 15
+                assert kwargs['max_retries'] == 0
             self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
         def __enter__(self):
@@ -663,8 +664,8 @@ def test_model_read_timeout_is_configurable_and_actionable(monkeypatch, protocol
         def __exit__(self, *args):
             pass
 
-        def mount(self, *args):
-            pass
+        def mount(self, prefix, adapter):
+            assert adapter.max_retries.read == 0 and adapter.max_retries.connect == 0
 
         def post(self, *args, **kwargs):
             assert kwargs['timeout'] == (15, 210)

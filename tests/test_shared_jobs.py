@@ -239,6 +239,82 @@ def test_short_final_planning_window_accepts_two_topics_on_resume(tmp_path):
     ]
 
 
+@pytest.mark.parametrize('with_previous_window', [False, True])
+def test_planning_timeout_splits_once_and_resumes_completed_subwindows(tmp_path, monkeypatch, with_previous_window):
+    requests, warnings = [], []
+    engine = Intelligence({}, lambda: None, warning=warnings.append)
+    first = [{'start': 0, 'end': 480, 'text': '前序技术说明'}] if with_previous_window else []
+    offset = first[-1]['end'] if first else 0
+    times = [0, 25, 55, 92, 180, 270, 360]
+    source = first + [{'start': offset + start, 'end': offset + end, 'text': f'资料条目{i}' + '技术资料' * 65}
+                      for i, (start, end) in enumerate(zip(times, times[1:]))]
+    checkpoint = tmp_path / 'plan.json'
+    interrupted = True
+    monkeypatch.setenv('MODEL_TIMEOUT_SECONDS', '240')
+
+    def complete(config, prompt, *args, read_timeout=None):
+        if prompt.startswith('判断两个相邻章节'):
+            return '{"merge":false}'
+        labels = tuple(cue['text'][:5] for cue in source if cue['text'] in prompt)
+        requests.append((labels, read_timeout))
+        if len(labels) == 6 or (interrupted and labels == ('资料条目4', '资料条目5')):
+            raise ModelTimeoutError()
+        return json.dumps({'title': '技术汇报', 'chapters': [{'title': labels[0], 'start_id': 0}]}, ensure_ascii=False)
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    with pytest.raises(ModelTimeoutError, match='章节规划'):
+        engine.plan(source, source[-1]['end'], {}, {}, checkpoint)
+    full = tuple(f'资料条目{i}' for i in range(6))
+    assert requests == ([(('前序技术说',), None)] if first else []) + [
+        (full, None), (full, 360),
+        (full[:4], None),
+        (full[4:], None),
+    ]
+    assert len(warnings) == 2
+    interrupted = False
+    requests.clear()
+    plan = engine.plan(source, source[-1]['end'], {}, {}, checkpoint)
+    assert requests == [(full[4:], None)]
+    assert [ch['start_id'] for ch in plan['chapters']] == ([0, 1, 5] if first else [0, 4])
+    assert plan['chapters'][-1]['start'] == offset + 180
+    assert plan['chapters'][0]['start'] == 0 and plan['chapters'][-1]['end'] == source[-1]['end']
+
+
+def test_planning_timeout_cut_accepts_one_full_length_cue_per_side():
+    cues = [{'start': 0, 'end': 180, 'text': '内容' * 240},
+            {'start': 180, 'end': 360, 'text': '资料' * 240}]
+    assert Intelligence.planning_timeout_cut(cues) == 1
+    assert Intelligence.planning_timeout_cut(cues[:1]) is None
+
+
+@pytest.mark.parametrize('retry_succeeds', [True, False])
+@pytest.mark.parametrize('cue_seconds,repeats', [(60, 65), (100, 1)])
+def test_short_or_sparse_planning_window_is_retried_intact(tmp_path, monkeypatch, retry_succeeds, cue_seconds, repeats):
+    calls = []
+    monkeypatch.setenv('MODEL_TIMEOUT_SECONDS', '240')
+
+    def complete(config, prompt, *args, read_timeout=None):
+        calls.append((prompt, read_timeout))
+        if read_timeout is None or not retry_succeeds:
+            raise ModelTimeoutError()
+        return '{"title":"技术汇报","chapters":[{"title":"技术说明","start_id":0}]}'
+
+    monkeypatch.setattr(model_client, 'complete', complete)
+    engine = Intelligence({}, lambda: None)
+    cues = [{'start': n * cue_seconds, 'end': (n + 1) * cue_seconds, 'text': f'说明 {n}' + '技术资料' * repeats}
+            for n in range(4)]
+    duration = cues[-1]['end']
+    checkpoint = tmp_path / 'plan.json'
+    if retry_succeeds:
+        assert engine.plan(cues, duration, {}, {}, checkpoint)['chapters'][-1]['end'] == duration
+    else:
+        with pytest.raises(ModelTimeoutError, match='章节规划'):
+            engine.plan(cues, duration, {}, {}, checkpoint)
+    assert len(calls) == 2 and calls[0][0] == calls[1][0]
+    assert [timeout for _, timeout in calls] == [None, 360]
+    assert not list(tmp_path.glob('*timeout-split.json'))
+
+
 def test_boundary_review_resumes_and_merges_only_continuing_topics(tmp_path):
     engine = Intelligence({}, lambda: None)
     source = [
