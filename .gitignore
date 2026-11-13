@@ -45,7 +45,7 @@ env/
 node_modules/
 dist/
 build/
-# Legacy browser FFmpeg bundle. The backend uses system FFmpeg.
+# Legacy browser FFmpeg bundle. The backend uses the Python environment's FFmpeg.
 /frontend/public/assets/ffmpeg/
 __pycache__/
 *.py[cod]

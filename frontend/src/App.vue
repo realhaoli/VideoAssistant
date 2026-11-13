@@ -95,6 +95,7 @@ function stageLabel(state, fallbackStart) {
 }
 const stageProgressText = computed(() => {
   const task = activeTask.value;
+  if (task?.stage === 'export') return stageLabel(task, task.updated_at);
   const outputs = Object.values(task?.output_states || {});
   const running = outputs.filter(output => output.status === 'running');
   const visible = running.length ? running : outputs.filter(output => output.status === 'queued');
@@ -606,13 +607,18 @@ onBeforeUnmount(() => {
       </button>
       <div class="nav-divider"></div>
       <div class="nav-label">最近任务</div>
-      <div v-if="!tasks.length" class="empty-recent">暂无任务</div>
-      <div v-for="task in tasks.slice(0, 6)" :key="task.id" class="recent-task"
-        :class="{active: view === 'detail' && selectedId === task.id}">
-        <button class="recent-task-open" :title="task.title" @click="openTask(task)">
-          <span class="status-dot" :class="task.status"></span><span>{{ task.title }}</span>
+      <div class="recent-task-list" role="region" aria-label="最近任务" tabindex="0">
+        <div v-if="!tasks.length" class="empty-recent">暂无任务</div>
+        <div v-for="task in tasks" :key="task.id" class="recent-task"
+          :class="{active: view === 'detail' && selectedId === task.id}">
+          <button class="recent-task-open" :title="task.title" @click="openTask(task)">
+            <span class="status-dot" :class="task.status"></span><span>{{ task.title }}</span>
+          </button>
+          <TaskActions :task="task" @rename="renameTask" @remove="remove" />
+        </div>
+        <button v-if="taskCount > tasks.length" class="nav-item recent-task-more" @click="openHistory">
+          查看全部任务
         </button>
-        <TaskActions :task="task" @rename="renameTask" @remove="remove" />
       </div>
       <div class="sidebar-bottom">
         <button class="nav-item settings-link" @click="openModels">

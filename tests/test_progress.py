@@ -46,19 +46,19 @@ def test_parallel_stages_keep_independent_start_times_and_progress(tmp_path, mon
     now = 100.0
     monkeypatch.setattr('local.jobs.time.time', lambda: now)
     tracker = OutputProgress(jobs, job['id'], job['modes'])
-    report = tracker.for_branch('report', {'text'})
-    pdf = tracker.for_branch('report', {'mindmap'})
-    report('overview', 89, '等待模型摘要')
+    tracker('chapters', '章节规划完成', 100)
+    tracker('report', '正文完成', 100)
+    tracker('overview', '等待模型摘要')
     now = 110
-    pdf('mindmap', 92, '生成导图', 50)
+    tracker('mindmap', '生成导图', 50)
     now = 115
-    report('overview', 89, '继续等待模型摘要')
+    tracker('overview', '继续等待模型摘要')
     states = jobs.get(job['id'])['output_states']
     assert states['text']['stage_started_at'] == 100 and states['text']['stage_progress'] is None
     assert states['mindmap']['stage_started_at'] == 110 and states['mindmap']['stage_progress'] == 50
     assert states['text']['progress'] < states['mindmap']['progress']
     now = 120
-    report('write_report', 92, '写入报告')
+    tracker('write_report', '写入报告', phase='write_text')
     assert jobs.get(job['id'])['output_states']['text']['stage_started_at'] == 120
 
 
@@ -66,19 +66,48 @@ def test_frame_progress_persists_at_stage_boundaries_and_throttles_intermediate_
     jobs = JobStore(tmp_path)
     job = jobs.create(modes=['illustrated'], source={}, options={}, enqueue=False)
     tracker = OutputProgress(jobs, job['id'], job['modes'])
-    progress = tracker.for_branch('report', {'illustrated'})
     tick = 100.0
     writes = []
     monkeypatch.setattr('local.jobs.time.monotonic', lambda: tick)
     monkeypatch.setattr('local.jobs.atomic_json', lambda target, value: writes.append(target.name))
     for sample in range(8):
-        progress('illustrated_frames', 89, '抽帧', sample * 12.5)
+        tracker('illustrated_frames', '抽帧', sample * 12.5, phase='illustrate', fraction=0)
     assert jobs.get(job['id'])['output_states']['illustrated']['stage_progress'] == 87.5
     assert writes == ['task.json', 'task.backup.json']
     tick += 1
-    progress('illustrated_frames', 89, '抽帧', 95)
-    progress('illustrated_frames', 89, '抽帧', 100)
+    tracker('illustrated_frames', '抽帧', 95, phase='illustrate', fraction=0)
+    tracker('illustrated_frames', '抽帧', 100, phase='illustrate', fraction=0)
     assert writes == ['task.json', 'task.backup.json'] * 3
+
+
+def test_total_progress_counts_shared_phases_once_and_reserves_work_for_slow_outputs(tmp_path):
+    jobs = JobStore(tmp_path)
+    modes = {'text', 'illustrated', 'download'}
+    job_id = jobs.create(modes=sorted(modes), source={}, options={}, enqueue=False)['id']
+    tracker = OutputProgress(jobs, job_id, modes)
+    tracker.configure(download={'download', 'illustrated'}, transcribe=modes)
+    tracker('transcribe', '转写', 50)
+    assert tracker.total() == pytest.approx(100 * 21 / sum(
+        tracker.weights[phase] for phase, consumers in tracker.phases.items() if consumers))
+    tracker.complete('inspect', 'transcribe', 'transcript', 'chapters', 'report', 'overview', 'write_text')
+    tracker.done('text')
+    tracker('waiting_video', '下载视频', 50, phase='download', visible={'download'})
+    current = jobs.get(job_id)
+    assert current['output_states']['text']['progress'] == 100
+    assert current['output_states']['download']['progress'] < 90
+    assert current['output_states']['illustrated']['progress'] < 80
+    assert current['progress'] < 80
+    tracker.failed('download', '下载失败')
+    tracker('export', '校验', visible=set())
+    assert jobs.get(job_id)['progress'] == current['progress']
+
+
+def test_recent_tasks_list_has_25_items_and_history_includes_older_records(tmp_path):
+    jobs = JobStore(tmp_path)
+    task_ids = [jobs.create(modes=['text'], source={}, options={}, enqueue=False)['id'] for _ in range(27)]
+    summary = jobs.summary_page(25, 25)
+    assert [task['id'] for task in summary['recent']] == list(reversed(task_ids[-25:]))
+    assert [task['id'] for task in summary['items']] == list(reversed(task_ids[:2]))
 
 
 @pytest.mark.parametrize('failure', [False, True], ids=['success', 'cancelled'])

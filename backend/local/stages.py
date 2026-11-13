@@ -1,6 +1,7 @@
 """A pipeline yields work to the appropriate bounded stage queue."""
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 from typing import Callable
 
 
@@ -8,7 +9,7 @@ from typing import Callable
 class Step:
     queue: str
     run: Callable
-    after: int | None = None
+    after: int | tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,12 +42,29 @@ class ParallelSteps:
             else:
                 scheduled.add_done_callback(lambda done: future.cancel() if done.cancelled() else None)
 
+        def enqueue_after(step, future, dependencies):
+            pending = len(dependencies)
+            lock = Lock()
+
+            def dependency_done(done):
+                nonlocal pending
+                with lock:
+                    pending -= 1
+                    ready = pending == 0
+                if done.cancelled():
+                    future.cancel()
+                elif ready and not any(dependency.cancelled() for dependency in dependencies):
+                    enqueue(step, future)
+
+            for dependency in dependencies:
+                dependency.add_done_callback(dependency_done)
+
         for step, future in zip(self.steps, futures):
             if step.after is None:
                 enqueue(step, future)
             else:
-                futures[step.after].add_done_callback(
-                    lambda done, item=step, result=future: result.cancel() if done.cancelled() else enqueue(item, result))
+                indexes = (step.after,) if isinstance(step.after, int) else step.after
+                enqueue_after(step, future, tuple(futures[index] for index in indexes))
         return futures
 
     def run(self):

@@ -20,7 +20,7 @@
 
 ### 1. 环境要求
 
-支持目标为 **Windows、macOS、Linux**，统一使用 Python 启动入口。前端生成的是静态网页，可以在三个平台使用；Python 虚拟环境、`node_modules`、FFmpeg 与 Chromium 必须在目标平台重新安装，不能从 Mac 直接复制。
+支持目标为 **Windows、macOS、Linux**，统一使用 Python 启动入口。前端静态文件可跨平台使用。请在目标平台重新创建虚拟环境、安装 Chromium，开发时在目标平台重新安装 `node_modules`。
 
 | 平台 | 建议环境 |
 | --- | --- |
@@ -31,25 +31,24 @@
 依赖的支持范围见 [Playwright](https://playwright.dev/python/docs/intro#system-requirements) 和 [CTranslate2](https://opennmt.net/CTranslate2/installation)。Windows ARM64 原生 Python 不在当前预编译依赖的适配目标内。
 
 - Python **3.12**（建议使用这一版本）。
-- Node.js **22 或更新版本**，用于构建 Vue 前端。
-- **FFmpeg 与 ffprobe**，应能在终端直接执行。
+- Python 依赖会安装 yt-dlp、FFmpeg、FFprobe 和 Node.js。项目直接调用虚拟环境里的对应程序。
 - 推荐安装 [uv](https://docs.astral.sh/uv/)。
 - Whisper small 多语言权重约 500 MB，首次准备时需要联网。CPU 模式也能运行，速度取决于视频时长和硬件。
 
-Windows 安装 [Python 3.12 x64](https://www.python.org/downloads/release/python-31210/)、[Node.js](https://nodejs.org/)、[FFmpeg（含 ffprobe）](https://ffmpeg.org/download.html) 和 [Visual C++ x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)。将 FFmpeg 的 `bin` 目录加入 `PATH`，重新打开终端，确认 `ffmpeg -version`、`ffprobe -version` 和 `node --version` 可执行。
+Windows 安装 [Python 3.12 x64](https://www.python.org/downloads/release/python-31210/) 和 [Visual C++ x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)。
 
 macOS 可通过 Homebrew 安装系统工具：
 
 ```bash
-brew install python@3.12 node ffmpeg uv
+brew install python@3.12 uv
 ```
 
 Ubuntu / Debian：
 
 ```bash
 sudo apt update
-sudo apt install ffmpeg python3-venv fonts-noto-cjk
-# 另行安装 Python 3.12、Node.js 22+ 和 uv
+sudo apt install python3-venv fonts-noto-cjk
+# 另行安装 Python 3.12 和 uv
 ```
 
 ### 2. 安装后端与前端
@@ -62,8 +61,7 @@ Windows PowerShell：
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
 .\.venv\Scripts\python.exe start-local.py --install-browser
-npm --prefix frontend ci
-npm --prefix frontend run build
+.\.venv\Scripts\python.exe start-local.py --build-frontend
 ```
 
 macOS / Linux：
@@ -73,8 +71,7 @@ cd "/你的项目目录"
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r backend/requirements.txt
 .venv/bin/python start-local.py --install-browser
-npm --prefix frontend ci
-npm --prefix frontend run build
+.venv/bin/python start-local.py --build-frontend
 ```
 
 Linux 手动部署还需安装 Chromium 系统依赖：
@@ -208,7 +205,7 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 ./start-local.sh --dev
 ```
 
-前端 `http://localhost:5173`，后端 `http://localhost:8080`。日志位于 `logs/`。修改前端代码后，正式使用前重新执行 `npm --prefix frontend run build`。
+前端 `http://localhost:5173`，后端 `http://localhost:8080`。日志位于 `logs/`。修改前端代码后，可用项目的 Python 执行 `start-local.py --build-frontend` 更新正式构建。
 
 可以通过 `--port 8081 --frontend-port 5174` 更换端口，Vite 的 API 代理会随之后端端口调整。Windows 局域网访问还需允许 Python 使用相应入站端口。停止启动器时会清理它启动的服务进程。
 
@@ -217,7 +214,7 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 1. 首页默认使用“视频链接”，也可切换到“上传文件”。两种输入区尺寸一致，字幕由系统自动检测和处理。
 2. 勾选一种或多种输出。
    每个功能附有产物说明及参考耗时范围：图文汇报为视频时长的 1–2 倍，文字汇报和思维导图为 0.5–1.5 倍，字幕为 0.5–1 倍，视频下载耗时取决于网速、已有字幕及封装。这些是参考预估，不是独立实测统计，不含排队时间；实际会受设备、字幕是否齐全、网速和模型速度影响，也可能超出范围。
-3. 内容场景自动判断。视频、汇报、导图和字幕文件共用同一份中文字幕。
+3. 内容场景自动判断。各产物共用源字幕和时间轴。只有字幕文件和带字幕视频需要完整的中文字幕轨。
 4. 提交后，在任务详情中查看进度和生成文件。所有结果的“预览”均在新页面打开；Markdown 预览会渲染为正文，视频支持播放与定位。
 5. 已生成文件会陆续开放下载。每种产物分别显示状态和进度；某个分支失败、其他文件完成时，任务显示“部分完成”。点击继续只补齐未完成产物，复用素材、转写和章节检查点。
 
@@ -247,12 +244,11 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 本次参考了同目录的 `media_to_doc-1.3.0` 的阶段产物/断点思想、`video-devour` 的字幕优先与视觉选帧思路，以及 Video Assistant 的网页交互和思维导图组件，重新实现本地流水线，不引入其整套依赖。
 
 1. **字幕优先**：先检查平台字幕、本地内嵌文字字幕或配套字幕；缺失才下载音频并用所选 Whisper 模型转写（默认 small）。保留时间戳与原始版本。
-2. **中文整理**：只有本地转写结果默认清洗。来源字幕为外语时翻译成中文，各产物共用同一份中文字幕。长视频分块处理并汇总。
-3. **章节规划**：按实质技术主题与真实字幕编号划分章节，开场、场地和公司历史并入第一个实质章节。正文直接陈述技术结论、机制和数据；仅至少两项产品/技术客观规格时使用参数表，禁止用历史年数、场地面积等凑表。结论与关键数据从核对后的正文提炼。默认提示词位于 `backend/local/report_prompts.py`，图文与文字汇报共用。
-4. **并行准备产物**。章节正文按字幕核查后，汇报摘要、导图 PDF 和图文候选帧可以并行准备。超过 8 分钟的章节分成最多 4 个选图区段。每段抽取 8 个位置，优先覆盖字幕提到参数或演示的时点，最多送审 4 张。导图从整章正文均匀选取最多 6 条要点。
-
-5. **图文联合评审**：将实际章节正文、配图目标、候选图和真实时间戳一起提交多模态模型，返回排序、理由和中文图注。允许全部不合适，避免强行插图。
-6. **跨章去重**。按时间顺序每段最多选用一张，记录已完成的配图和对应时间。图片放在章节开头说明之后。封面单独用作首页素材。
+2. **字幕清洗与翻译**。只有本地转写结果默认清洗，并保留转写语言。选了字幕文件或带字幕视频时才把外语整轨译成简体中文，两种产物复用同一次翻译。长视频分块处理并汇总。
+3. **章节规划**。用源语言字幕按实质技术主题与真实字幕编号划分章节，提取和核对事实后直接写简体中文正文。外语素材的配图可根据已核对的中文事实、原文引文和字幕时间定位。开场、场地和公司历史并入第一个实质章节。正文直接陈述技术结论、机制和数据。仅有至少两项客观规格时使用参数表。结论与关键数据从核对后的正文提炼。
+4. **并行准备产物**。正文核查后，汇报摘要、导图 PDF 和图文候选帧可以并行准备。图文按正文段落匹配对应字幕，优先考虑售价、参数、演示等有字幕证据的要点。每章最多选 4 个要点。导图从整章正文均匀选取最多 6 条要点。
+5. **局部找图与评审**。每个要点最多搜三轮，以字幕证据为中心依次搜索前后各 8、24、48 秒。首轮或第二轮没有合适图时，下一轮优先检查新增范围内的场景。每轮以每秒两帧扫描低分辨率画面，缓存代表帧时间，最多抽取 8 张候选并送审其中 4 张。
+6. **插入与去重**。每个要点最多一张图，沿用已抽取的清晰候选图，放在对应段落后并保留视频时刻。候选图按画面指纹与本要点已送审的图、同一汇报其他要点已入选的图去重。图注中的数字需同时出现在正文和模型从画面抄录的可读文字中。没有合适图或视觉评审不可用时，保留正文并省略该处配图。视频封面配在开头的总结和核心结论下方、目录上方。
 7. **便携导出**：HTML 与 Markdown 都引用 `image/...jpg` 相对路径；图文 ZIP 只包含 `illustrated.html`、`illustrated.md`、实际使用的封面和配图，图片统一位于 `image/`。解压后保持文件结构即可离线打开。不会把文字报告、字幕、视频、导图和诊断文件混入图文包。打包前逐个检查图片引用，缺图直接报错。
 
 任务按检查素材、下载、媒体提取、转写、字幕模型处理、视频封装和报告生成等阶段分别排队。`TASK_WORKERS=1–8` 默认值为 2，控制检查和报告生成阶段的并发。每个任务最多占用一个模型请求，全服务默认最多两个模型请求。下载、重型 FFmpeg、Whisper 和 PDF 默认单路。文字正文、已配好图的图文包可以在摘要完成前下载。摘要失败时点「继续处理」可复用正文和选图结果补做。历史列表按页读取摘要，打开任务详情时读取事件记录。
@@ -263,7 +259,7 @@ Windows：`.\start-local.cmd --dev`。macOS / Linux：
 
 平台提供清晰度分档时，图文素材下载上限为 **1080p**。普通单文件直链没有分档可选时使用原文件，抽帧输出限制在 1920×1080 内。仅文字、导图或字幕任务如果有现成字幕，不下载完整视频；缺失字幕时只下载音频。
 
-同时选择多项输出时，共用字幕读取、Whisper 转写、清洗和翻译结果。有中文字幕时，文稿和视频下载可并行。需要下载视频检查字幕或转写时，下载一次最高可用画质的素材，并复用其音轨和画面。各产物独立发布。封装优先保留兼容的音视频编码。
+同时选择多项输出时，共用字幕读取、Whisper 转写和清洗结果。报告生成和整轨翻译独立调度，共用全局模型并发限制。需要下载视频检查字幕或转写时，下载一次最高可用画质的素材，并复用其音轨和画面。各产物独立发布。封装优先保留兼容的音视频编码。
 
 ### RTX 3070 与 CPU 兜底
 
@@ -353,7 +349,7 @@ docker compose up -d --build
 ```bash
 uv pip install --python .venv/bin/python -r backend/requirements-dev.txt
 .venv/bin/python -m pytest -q
-npm --prefix frontend run build
+.venv/bin/python start-local.py --build-frontend
 ```
 
 Windows 将上述 `.venv/bin/python` 换为 `.\.venv\Scripts\python.exe`；如果没有 uv，使用 `.\.venv\Scripts\python.exe -m pip install -r backend/requirements-dev.txt` 安装测试依赖。不需要单独设置 `PYTHONPATH`。实际后台 PDF 测试需先安装浏览器并构建前端，然后设置 `RUN_PDF_RENDER_TEST=1`（PowerShell：`$env:RUN_PDF_RENDER_TEST='1'`；Bash：`RUN_PDF_RENDER_TEST=1 .venv/bin/python -m pytest -q`）。
@@ -365,7 +361,6 @@ GitHub Actions 的 `Windows, macOS and Linux` 工作流在三个系统分别安�
 ## 已知范围
 
 - 在线平台的反爬、登录、会员或地区限制不能由通用下载器保证绕过；当前网页不收集平台账号密码。如需登录态，可在服务器上自行准备 Netscape 格式 cookies 文件并通过 `YTDLP_COOKIES_FILE` 指定路径。
-- 多模态模型不可用时，会记录提示并退回清晰度选帧；没有合适画面时不硬插图。
 - 本次没有图片生成功能，不调用生图模型。
 - 最终生成物按功能仅提供 HTML、MD、PDF、中文 TXT、MP4；图文下载为仅含该报告及所用图片的 ZIP。内部 SRT、JSON 和检查点不作为下载文件展示。未实现 PPTX / DOCX 导出。
 

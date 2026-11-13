@@ -72,14 +72,18 @@ def resource_lease(job_id, filename):
 
 @secured.get("/settings")
 def settings(whisper_model: str | None = None):
-    import shutil
     from local.media import whisper_status
+    from local.runtime import ffmpeg_paths
     values = config.public()
     model = whisper_model or values["whisper_model"]
     if model not in config.WHISPER_MODELS:
         raise HTTPException(400, "不支持的 Whisper 模型")
-    return values | {"ffmpeg_available": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
-                     **whisper_status(model)}
+    try:
+        ffmpeg_paths()
+        ffmpeg_available = True
+    except RuntimeError:
+        ffmpeg_available = False
+    return values | {"ffmpeg_available": ffmpeg_available, **whisper_status(model)}
 
 
 class ModelSettings(BaseModel):

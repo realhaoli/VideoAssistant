@@ -5,7 +5,6 @@ import importlib
 import importlib.util
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import sys
@@ -22,7 +21,8 @@ def stop_process(process):
     if os.name == "nt":
         if process.poll() is None:
             # Terminate Node/Chromium descendants too, not just their parent.
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
+            subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     else:
         with contextlib.suppress(ProcessLookupError):
@@ -68,6 +68,7 @@ def main(argv=None):
     parser.add_argument("--port", type=int, help="backend port; default: PORT or 8080")
     parser.add_argument("--frontend-port", type=int, default=5173)
     parser.add_argument("--install-browser", action="store_true", help="install the local Chromium headless shell")
+    parser.add_argument("--build-frontend", action="store_true", help="install and build the frontend using the Python environment")
     parser.add_argument("--with-deps", action="store_true", help="also install Linux browser system dependencies")
     parser.add_argument("--check", action="store_true", help="check runtime dependencies without starting services")
     args = parser.parse_args(argv)
@@ -91,16 +92,32 @@ def main(argv=None):
     if args.install_browser:
         return subprocess.call([str(python), "-m", "playwright", "install", "chromium", "--only-shell",
                                 *(["--with-deps"] if args.with_deps else [])], env=env, cwd=ROOT)
-    missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
-    missing += [name for name in ("uvicorn", "fastapi", "faster_whisper", "playwright", "opencc") if importlib.util.find_spec(name) is None]
+    missing = [name for name in ("uvicorn", "fastapi", "faster_whisper", "playwright", "opencc",
+                                 "yt_dlp", "yt_dlp_ejs") if importlib.util.find_spec(name) is None]
     if missing:
         parser.exit(1, "Missing runtime dependencies: " + ", ".join(missing) + ". See README.md.\n")
+    from local.runtime import ffmpeg_paths, node_path
+    try:
+        node = node_path()
+        ffmpeg, ffprobe = ffmpeg_paths()
+    except RuntimeError as exc:
+        parser.exit(1, f"{exc}\n{exc.__cause__ or ''}\n")
+    if args.build_frontend:
+        from nodejs_wheel import npm
+        env["PATH"] = os.pathsep.join(filter(None, (str(Path(node).parent), env.get("PATH"))))
+        prefix = ["--prefix", str(ROOT / "frontend")]
+        return npm([*prefix, "ci"], env=env) or npm([*prefix, "run", "build"], env=env)
     if args.check:
         try:
             for module in ("faster_whisper", "av", "opencc"):
                 importlib.import_module(module)
         except (ImportError, OSError) as exc:
             parser.exit(1, f"Cannot load native media dependencies: {exc}\nOn Windows, install the Visual C++ x64 runtime.\n")
+        for executable, flag in ((ffmpeg, "-version"), (ffprobe, "-version"), (node, "--version")):
+            try:
+                subprocess.run([executable, flag], check=True, capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                parser.exit(1, f"Cannot execute {executable}: {exc}\n")
         print("Runtime dependencies found. Browser directory:", env["PLAYWRIGHT_BROWSERS_PATH"])
         print("Build the frontend and run --install-browser before first use.")
         return 0
@@ -111,9 +128,8 @@ def main(argv=None):
     backend = [str(python), "-m", "uvicorn", "app:app", "--app-dir", str(ROOT / "backend"), "--host", host, "--port", str(port)]
     if args.dev:
         vite = ROOT / "frontend" / "node_modules" / "vite" / "bin" / "vite.js"
-        node = shutil.which("node")
-        if not node or not vite.is_file():
-            parser.exit(1, "Install Node.js 22+ and run: npm --prefix frontend ci\n")
+        if not vite.is_file():
+            parser.exit(1, "Run: python start-local.py --build-frontend\n")
         (ROOT / "logs").mkdir(exist_ok=True)
         env["BACKEND_PORT"] = str(port)
         commands = [("backend", backend, ROOT / "logs" / "backend.log"),
@@ -122,7 +138,7 @@ def main(argv=None):
         print(f"Development: http://localhost:{args.frontend_port} (logs/)", flush=True)
     else:
         if not all((ROOT / "frontend" / "dist" / name).is_file() for name in ("index.html", "mindmap-renderer.js")):
-            parser.exit(1, "Build the frontend first: npm --prefix frontend ci && npm --prefix frontend run build\n")
+            parser.exit(1, "Build the frontend first: python start-local.py --build-frontend\n")
         commands = [("backend", backend, None)]
         print(f"Video Assistant: http://localhost:{port}", flush=True)
     def interrupt(*_):

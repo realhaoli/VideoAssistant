@@ -14,6 +14,7 @@ from local.jobs import JobStore, OutputFailure
 
 MODES = ['illustrated','text','mindmap','subtitles','download']
 COMBINATIONS = [list(group) for size in range(1,6) for group in combinations(MODES,size)]
+ORIGINAL_DRAFT = Intelligence.draft
 
 
 def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
@@ -43,7 +44,10 @@ def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
         calls.append('asr');args[3](50);return cues,'zh'
     monkeypatch.setattr(media,'transcribe',transcribe)
     monkeypatch.setattr(Intelligence,'plan',lambda *args:{'title':'组合测试','chapters':[{'title':'电池技术','start':0,'end':7200,'points':['容量100kWh']}]})
-    def draft(*args):calls.append('draft');return '电池容量100kWh，续航目标600km。'
+    def draft(*args, source_language='zh'):
+        calls.append('draft')
+        body = '电池容量100kWh，续航目标600km。'
+        return body if source_language == 'zh' else {'body': body, 'facts': []}
     monkeypatch.setattr(Intelligence,'draft',draft)
     monkeypatch.setattr(Intelligence,'overview',lambda *args:{'one_sentence':'电池容量100kWh。','key_conclusions':[],'data_terms':[]})
     monkeypatch.setattr(Intelligence,'transform',lambda self,segments,**kwargs:segments)
@@ -79,7 +83,7 @@ def test_all_output_combinations_complete_without_unselected_outputs(tmp_path, m
     (None, 'zh', []), (None, 'en', ['zh']),
 ])
 @pytest.mark.parametrize('with_document', [False, True])
-def test_video_and_documents_share_the_same_chinese_subtitles(tmp_path, monkeypatch, track, asr_language, expected, with_document):
+def test_video_and_subtitle_files_share_translation_while_reports_use_source(tmp_path, monkeypatch, track, asr_language, expected, with_document):
     monkeypatch.delenv('ASR_CLEANUP_MODE', raising=False)
     modes = ['download', 'subtitles', 'text'] if with_document else ['download']
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, modes)
@@ -112,7 +116,7 @@ def test_video_and_documents_share_the_same_chinese_subtitles(tmp_path, monkeypa
         assert '00:00:02,000' not in (folder / 'subtitles.zh.srt').read_text(encoding='utf-8')
     english = folder / 'output/subtitles.en.txt'
     if with_document:
-        assert report_cues == [{**cues[0], 'text': video_text}]
+        assert report_cues == cues
         assert video_text in (folder / 'output/subtitles.zh.txt').read_text(encoding='utf-8')
     if with_document and (track or asr_language) == 'en':
         assert english.read_text(encoding='utf-8').splitlines()[1] == '字幕样本'
@@ -135,6 +139,75 @@ def test_existing_subtitles_allow_video_when_report_generation_fails(tmp_path, m
     assert set(failure.value.errors) == {'text'}
     assert (folder / 'output/video.mp4').is_file()
     assert jobs.get(task['id'])['output_states']['download']['status'] == 'completed'
+
+
+def test_english_illustrated_report_uses_verified_source_time_without_translation(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
+    quote = 'The display shows a battery capacity of 100 kWh.'
+    cues = [{'start': 0, 'end': 4, 'text': 'Welcome to the presentation.'},
+            {'start': 44, 'end': 49, 'text': quote}]
+    monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {'en': cues})
+    monkeypatch.setattr(Intelligence, 'transform', lambda *args, **kwargs: pytest.fail('报告无需整轨翻译'))
+    body = '屏幕显示电池容量为100kWh。'
+    prompts = []
+
+    def chat(engine, prompt, **kwargs):
+        prompts.append(prompt)
+        if kwargs.get('json_result'):
+            return {'facts': [
+                {'cue_index': 0, 'quote': quote, 'text': '错误时间点的事实。'},
+                {'cue_index': 1, 'quote': quote, 'text': body},
+            ]}
+        return body
+
+    def candidates(path, chapter, output, index, used, check, **kwargs):
+        assert chapter['evidence_time'] == 44
+        assert chapter['evidence_cue_id'] == 1
+        assert chapter['evidence_text'] == quote
+        return [dict(path=folder / 'cover.jpg', time=45, hash=0)]
+
+    monkeypatch.setattr(Intelligence, 'draft', ORIGINAL_DRAFT)
+    monkeypatch.setattr(Intelligence, 'chat', chat)
+    monkeypatch.setattr(media, 'candidates', candidates)
+    monkeypatch.setattr(Intelligence, 'select',
+                        lambda engine, chapter, images, text: [dict(candidate=images[0], caption='容量画面')])
+    pipeline.run(jobs, task['id'])
+    assert quote in prompts[0] and quote in prompts[-1]
+    assert '错误时间点的事实' not in prompts[-1]
+    assert not (folder / 'subtitles.zh.srt').exists()
+    report = (folder / 'output/illustrated.md').read_text(encoding='utf-8')
+    assert body in report and '![容量画面]' in report
+    assert json.loads((folder / 'image-selections.json').read_text(encoding='utf-8'))[0]['evidence_cue_id'] == 1
+
+
+def test_english_report_finishes_while_translation_waits_and_survives_its_failure(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text', 'subtitles', 'download'], source='url')
+    cues = [{'start': 0, 'end': 5, 'text': 'The battery capacity is 100 kWh.'}]
+    monkeypatch.setattr(media, 'inspect_url', lambda *args, **kwargs: ({'title': '组合测试', 'duration': 7200}, {'en': cues}))
+    translation_started, release = threading.Event(), threading.Event()
+
+    def transform(engine, segments, **kwargs):
+        assert segments == cues and kwargs['language'] == 'zh'
+        translation_started.set()
+        assert release.wait(8)
+        raise RuntimeError('translation gateway failed')
+
+    monkeypatch.setattr(Intelligence, 'transform', transform)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(pipeline.run, jobs, task['id'])
+        try:
+            assert translation_started.wait(3)
+            deadline = time.monotonic() + 5
+            while jobs.output_states(task['id'])['text']['status'] != 'completed':
+                assert time.monotonic() < deadline
+                time.sleep(.01)
+            assert not (folder / 'output/video.mp4').exists()
+        finally:
+            release.set()
+        with pytest.raises(OutputFailure) as failure:
+            running.result(timeout=5)
+    assert set(failure.value.errors) == {'subtitles', 'download'}
+    assert (folder / 'output/text.html').is_file()
 
 
 def test_pdf_failure_preserves_other_outputs_and_retry_only_rebuilds_pdf(tmp_path,monkeypatch):
@@ -175,16 +248,21 @@ def test_long_chapter_reuses_completed_figures_after_a_later_segment_fails(tmp_p
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
     selected = []
     interrupt = True
+    subjects = ['定价策略', '底盘结构', '座舱屏幕', '辅助驾驶']
+    cues = [{'start': part * 1800 + 40, 'end': part * 1800 + 50, 'text': f'{subject}展示{part}项技术细节。'}
+            for part, subject in enumerate(subjects)]
+    monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {'zh': cues})
+    monkeypatch.setattr(Intelligence, 'draft', lambda *args: '\n\n'.join(cue['text'] for cue in cues))
 
     def candidates(path, chapter, output, index, used, check, **kwargs):
-        start = chapter['start']
+        start = chapter['evidence_time']
         part = int(start // 1800)
         if interrupt and part == 2:
             raise OSError('fixture interrupted')
         return [dict(path=folder/'cover.jpg', time=start+1, hash=((1 << 24) - 1) << (24*part))]
 
     def select(engine, chapter, images, body):
-        selected.append((chapter['start'], chapter['end']))
+        selected.append((chapter['evidence_time'], body))
         return [dict(candidate=images[0], caption='技术画面')]
 
     monkeypatch.setattr(media, 'candidates', candidates)
@@ -194,8 +272,102 @@ def test_long_chapter_reuses_completed_figures_after_a_later_segment_fails(tmp_p
     assert len(list(folder.glob('model-checkpoints/**/figure-*.json'))) == 2
     interrupt = False
     pipeline.run(jobs, task['id'])
-    assert selected == [(n*1800, (n+1)*1800) for n in range(4)]
+    assert selected == [(cue['start'], cue['text']) for cue in cues]
     assert len(json.loads((folder/'image-selections.json').read_text(encoding='utf-8'))) == 4
+    report = (folder / 'output' / 'illustrated.md').read_text(encoding='utf-8')
+    for part, cue in enumerate(cues, 1):
+        assert cue['text'] + f'\n\n![技术画面](image/chapter-01-{part:02d}.jpg)' in report
+
+
+@pytest.mark.parametrize('vision_unavailable', [False, True])
+def test_unrelated_or_unreviewed_frames_are_not_published(tmp_path, monkeypatch, vision_unavailable):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
+    searches = []
+    reviewed = []
+
+    def candidates(path, chapter, output, index, used, check, *, exclude_times, **kwargs):
+        radius = chapter['search_radius']
+        searches.append((radius, chapter['previous_search_radius'], list(exclude_times)))
+        return [dict(path=folder / 'cover.jpg', time=radius, hash=((1 << 16) - 1) << radius)]
+
+    def select(engine, chapter, images, body):
+        reviewed.extend(image['time'] for image in images)
+        if vision_unavailable:
+            raise TimeoutError('gateway timeout')
+        return []
+
+    monkeypatch.setattr(media, 'candidates', candidates)
+    monkeypatch.setattr(Intelligence, 'select', select)
+    pipeline.run(jobs, task['id'])
+    assert searches == ([(8, None, [])] if vision_unavailable else [(8, None, []), (24, 8, [8]), (48, 24, [8, 24])])
+    assert reviewed == ([8] if vision_unavailable else [8, 24, 48])
+    assert json.loads((folder / 'image-selections.json').read_text(encoding='utf-8')) == []
+    assert '电池容量100kWh' in (folder / 'output' / 'illustrated.md').read_text(encoding='utf-8')
+    assert (folder / 'output' / 'illustrated.zip').is_file()
+
+
+def test_expanded_rounds_skip_near_duplicate_frames_across_chapters(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
+    cues = [{'start': 60, 'end': 65, 'text': '电池容量100kWh。'},
+            {'start': 180, 'end': 185, 'text': '座舱屏幕展示导航界面。'}]
+    chapters = [{'title': '电池参数', 'start': 0, 'end': 120},
+                {'title': '座舱界面', 'start': 120, 'end': 7200}]
+    monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {'zh': cues})
+    monkeypatch.setattr(Intelligence, 'plan', lambda *args: {'title': '组合测试', 'chapters': chapters})
+    monkeypatch.setattr(Intelligence, 'draft', lambda engine, chapter, *args: cues[chapter['start'] > 0]['text'])
+    reviewed = []
+    searches = []
+    rejected_hash = (1 << 24) - 1
+    final_hash = rejected_hash << 32
+
+    def candidates(path, chapter, output, index, used, check, **kwargs):
+        radius = chapter['search_radius']
+        searches.append((index, radius))
+        hashes = {8: [0] if index == 0 else [1, rejected_hash],
+                  24: [2, rejected_hash ^ 1], 48: [3, final_hash]}[radius]
+        return [dict(path=folder / 'cover.jpg', time=chapter['evidence_time'] + radius + i, hash=value)
+                for i, value in enumerate(hashes)]
+
+    def select(engine, chapter, images, body):
+        hashes = [image['hash'] for image in images]
+        reviewed.append(hashes)
+        return [] if hashes == [rejected_hash] else [dict(candidate=images[0], caption='技术画面')]
+
+    monkeypatch.setattr(media, 'candidates', candidates)
+    monkeypatch.setattr(Intelligence, 'select', select)
+    pipeline.run(jobs, task['id'])
+    assert searches == [(0, 8), (1, 8), (1, 24), (1, 48)]
+    assert reviewed == [[0], [rejected_hash], [final_hash]]
+    assert [entry['time'] for entry in json.loads((folder / 'image-selections.json').read_text())] == [68, 229]
+
+
+def test_illustrated_report_leaves_background_without_inline_images(tmp_path, monkeypatch):
+    jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['illustrated'])
+    text = '发布会首先向长期关注品牌发展的来宾表示感谢。'
+    cue = {'start': 0, 'end': 12, 'text': text}
+    monkeypatch.setattr(media, 'embedded_subtitles', lambda *args: {'zh': [cue]})
+    monkeypatch.setattr(Intelligence, 'draft', lambda *args: '### 产品展示\n\n' + text)
+    monkeypatch.setattr(media, 'candidates', lambda *args, **kwargs: pytest.fail('背景段落无需抽帧'))
+    pipeline.run(jobs, task['id'])
+    assert json.loads((folder / 'image-selections.json').read_text(encoding='utf-8')) == []
+    report = (folder / 'output/illustrated.md').read_text(encoding='utf-8')
+    assert text in report and '![视频封面]' in report
+
+
+def test_illustrations_use_distinct_product_points_inside_a_short_chapter():
+    body = ("### 技术要点\n"
+            "- 车底风扇可提供高达2G吸力，支持倒挂行驶。\n"
+            "- 后尾翼具有可变倾角，可动态调节下压力。\n\n"
+            "### 风险与限制\n\n"
+            "风扇演示成功并不保证。")
+    cues = [{'start': 12, 'end': 16, 'text': '车底风扇能产生高达2G的吸力。'},
+            {'start': 30, 'end': 35, 'text': '后尾翼具有可变倾角。'},
+            {'start': 42, 'end': 46, 'text': '风扇演示并不保证成功。'}]
+    blocks, targets = pipeline._illustration_targets({'start': 0, 'end': 60}, body, cues, lambda: None)
+    assert [(blocks[position], cue['start']) for position, cue in targets] == [
+        ('- 车底风扇可提供高达2G吸力，支持倒挂行驶。', 12),
+        ('- 后尾翼具有可变倾角，可动态调节下压力。', 30),
+    ]
 
 
 def test_video_outputs_start_when_both_report_slots_are_occupied(tmp_path, monkeypatch):
@@ -392,10 +564,15 @@ def test_pdf_is_published_and_frames_start_while_report_summary_is_waiting(tmp_p
                 time.sleep(.01)
             assert '电池容量' in (folder / 'output/text.html').read_text(encoding='utf-8')
             assert '一句话总结' not in (folder / 'output/text.html').read_text(encoding='utf-8')
+            draft_report = (folder / 'output/illustrated.md').read_text(encoding='utf-8')
+            assert draft_report.index('# 组合测试') < draft_report.index('![视频封面]') < draft_report.index('**目录**')
         finally:
             release.set()
         pending.result(timeout=5)
     assert '一句话总结' in (folder / 'output/text.html').read_text(encoding='utf-8')
+    report = (folder / 'output/illustrated.md').read_text(encoding='utf-8')
+    assert report.index('**一句话总结：**') < report.index('![视频封面]') < report.index('**目录**')
+    assert '![视频封面]' not in (folder / 'output/text.md').read_text(encoding='utf-8')
     assert not list(folder.glob('*.summary-pending'))
 
 
@@ -460,7 +637,7 @@ def test_retry_with_current_model_rebuilds_unfinished_model_stages(tmp_path, mon
     assert not (folder / 'text.summary-pending').exists()
 
 
-def test_subtitle_model_routes_cleanup_and_translation_and_keeps_cache_on_report_switch(tmp_path, monkeypatch):
+def test_subtitle_model_cleans_english_reports_without_translating_and_keeps_cache_on_report_switch(tmp_path, monkeypatch):
     from local.limits import budget
 
     jobs, task, folder, _, _ = prepare(tmp_path, monkeypatch, ['text'], native=False)
@@ -492,9 +669,7 @@ def test_subtitle_model_routes_cleanup_and_translation_and_keeps_cache_on_report
     monkeypatch.setattr('local.jobs.load', lambda: {**settings, 'llm_model':'report-two'})
     jobs.retry(task['id'], use_current_model=True)
     pipeline.run(jobs, task['id'])
-    assert subtitle_calls == [
-        ('subtitle-model', (24000, 4096), None, True), ('subtitle-model', (24000, 4096), 'zh', False),
-    ]
+    assert subtitle_calls == [('subtitle-model', (24000, 4096), None, True)]
     assert report_calls == ['report-one', 'report-two']
     assert (folder / 'output/text.html').is_file()
 

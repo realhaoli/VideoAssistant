@@ -1,7 +1,6 @@
 import asyncio
 import json
 import re
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -121,7 +120,6 @@ def test_upload_and_artifact_access(tmp_path, monkeypatch):
     asyncio.run(exercise())
 
 
-@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg required')
 @pytest.mark.parametrize('source_language', ['zho', 'eng'])
 def test_real_video_download_embeds_subtitle_tracks_for_source_language(tmp_path, monkeypatch, source_language):
     from local import pipeline
@@ -170,10 +168,20 @@ def test_whisper_word_alignment_creates_real_sentence_cues():
 
 def test_visual_caption_cannot_add_unsupported_numbers(tmp_path):
     engine = Intelligence({}, lambda: None)
-    engine.chat = lambda *args, **kwargs: {'rankings':[{'index':0,'caption':'续航达到 99 小时','score':90,'reason':'展示产品参数'}]}
+    engine.chat = lambda *args, **kwargs: {'rankings':[{
+        'index':0,'caption':'续航达到 99 小时','score':90,'kind':'product','reason':'展示电池实物'}]}
     image = {'path':tmp_path/'image.jpg','time':2.0,'hash':0,'quality':10}
     rankings = engine.select({'title':'产品参数','visual_query':'续航说明'}, [image], '产品续航为 12 小时。')
     assert rankings[0]['caption'] == '原视频画面 · 产品参数'
+
+    engine.chat = lambda *args, **kwargs: {'rankings': [
+        {'index': 0, 'score': 90, 'kind': 'parameter', 'reason': '规格页', 'caption': '续航 12 小时', 'visible_text': ''},
+    ]}
+    assert engine.select({'title': '产品参数'}, [image], '产品续航为 12 小时。') == []
+    engine.chat = lambda *args, **kwargs: {'rankings': [
+        {'index': 0, 'score': 90, 'kind': 'parameter', 'reason': '规格页标出续航', 'caption': '续航 12 小时', 'visible_text': '续航 12 小时'},
+    ]}
+    assert engine.select({'title': '产品参数'}, [image], '产品续航为 12 小时。')[0]['caption'] == '续航 12 小时'
 
 
 def test_portable_html_does_not_load_model_generated_remote_images(tmp_path):
@@ -448,6 +456,11 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
     if 'text' in modes:
         report = (output/'text.md').read_text(encoding='utf-8')
         assert '电池系统' in report and '续航12小时' in report and '電池' not in report and '續航' not in report
+    for mode in {'text', 'illustrated'} & set(modes):
+        report = (output / f'{mode}.md').read_text(encoding='utf-8')
+        html = (output / f'{mode}.html').read_text(encoding='utf-8')
+        assert '## 一、续航与容量' in report and '### 1.1 关键参数' in report
+        assert '一、续航与容量</h2>' in html and '1.1 关键参数</h3>' in html
     if 'mindmap' in modes:
         assert (folder/'mindmap.json').is_file()
         assert '续航与容量' in (folder/'mindmap.json').read_text(encoding='utf-8')
@@ -685,6 +698,7 @@ def test_model_read_timeout_is_configurable_and_actionable(monkeypatch, protocol
 def test_frame_cache_does_not_reuse_different_chapter_times(tmp_path,monkeypatch):
     from PIL import Image
     calls=[]
+    (tmp_path/'source.mp4').write_bytes(b'fixture')
     def frame(path,timestamp,target,check):
         calls.append((timestamp,target.name));Image.new('RGB',(80,40),'white').save(target)
     monkeypatch.setattr(media,'frame',frame)
@@ -695,6 +709,51 @@ def test_frame_cache_does_not_reuse_different_chapter_times(tmp_path,monkeypatch
     first={name for _,name in calls};calls.clear()
     media.candidates(tmp_path/'source.mp4',{'start':300,'end':360},tmp_path,0,[],lambda:None)
     assert len(calls)==8 and not first.intersection(name for _,name in calls)
+
+
+def test_expanded_frame_search_prefers_new_scenes_after_excluding_prior_times(tmp_path, monkeypatch):
+    source = tmp_path / 'video.mp4'
+    source.write_bytes(b'video')
+    times = [36, 45, 49, 50, 51, 55, 59, 64, 70]
+    monkeypatch.setattr(media, 'scene_samples', lambda *args: times)
+    monkeypatch.setattr(media, 'frame', lambda path, timestamp, target, check: target.write_bytes(b'frame'))
+    monkeypatch.setattr(media, 'image_quality', lambda path: 10 if path.stem == '55000' else 2)
+    monkeypatch.setattr(media, 'image_hash', lambda path: ((1 << 16) - 1) << (int(path.stem) // 1000))
+    chapter = {'start': 0, 'end': 80, 'evidence_time': 50, 'search_radius': 24, 'previous_search_radius': 8}
+    results = media.candidates(source, chapter, tmp_path / 'frames', 0, [], lambda: None,
+                               exclude_times=(45, 49, 50, 51))
+    assert len(results) <= 4
+    assert results[0]['time'] in {36, 59, 64, 70}
+    assert any(result['time'] == 70 for result in results)
+    assert not {45, 49, 50, 51} & {result['time'] for result in results}
+    monkeypatch.setattr(media, 'scene_samples', lambda *args: pytest.fail('reuse cached scene times'))
+    assert media.candidates(source, chapter, tmp_path / 'frames', 0, [], lambda: None,
+                            exclude_times=(45, 49, 50, 51)) == results
+
+
+def test_local_scene_scan_keeps_a_one_second_white_price_slide(tmp_path):
+    from PIL import Image, ImageDraw
+
+    slides = []
+    for index, background in enumerate(("black", "white", "black")):
+        path = tmp_path / f"slide-{index}.png"
+        image = Image.new("RGB", (320, 180), background)
+        if index == 1:
+            draw = ImageDraw.Draw(image)
+            draw.text((105, 78), "Price 129,800", fill="black")
+        image.save(path)
+        slides.append(path)
+    video = tmp_path / "video.mp4"
+    command = ["ffmpeg", "-v", "error"]
+    for path, duration in zip(slides, (3, 1, 4)):
+        command.extend(["-loop", "1", "-framerate", "20", "-t", str(duration), "-i", str(path)])
+    media.command(command + ["-filter_complex", "concat=n=3:v=1:a=0,format=yuv420p", "-c:v", "libx264", str(video)])
+    assert media.image_quality(slides[1]) > .4
+    assert media.image_quality(slides[0]) == 0
+    scene = {"start": 0, "end": 8, "evidence_time": 4.5}
+    frames = media.candidates(video, scene, tmp_path / "frames", 0, [], lambda: None)
+    assert len(frames) <= 4
+    assert any(3 <= frame["time"] < 4 for frame in frames)
 
 
 def test_predicted_top_speed_does_not_become_measured_fact():

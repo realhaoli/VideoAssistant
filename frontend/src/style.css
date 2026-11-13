@@ -166,6 +166,20 @@ input[type="checkbox"] {
   background: #ebeef5;
   margin: 22px 10px;
 }
+.sidebar > :not(.recent-task-list) {
+  flex-shrink: 0;
+}
+.recent-task-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+.recent-task-more {
+  color: #337ecc;
+  font-size: 12px;
+}
 .recent-task {
   display: flex;
   align-items: center;
@@ -1052,8 +1066,7 @@ input[type="checkbox"] {
     font-size: 25px;
   }
   .nav-label,
-  .recent-task,
-  .empty-recent,
+  .recent-task-list,
   .nav-divider,
   .count,
   .sidebar-version {

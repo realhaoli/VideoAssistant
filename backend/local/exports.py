@@ -78,7 +78,51 @@ def clean_report(text):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def grounded_body(text, source):
+TITLE_NUMBER = re.compile(
+    r"^(?:第[零〇一二三四五六七八九十百千\d]+[章节]\s*[、：:.．]?\s*|"
+    r"(?:[零〇一二三四五六七八九十百千]+[、.．]|\d+[、．]|\d+\.)\s*(?!\d)|"
+    r"\d+(?:\.\d+)+[.)]\s*|\d+(?:\.\d+)+\s+(?=[\u3400-\u9fff]))"
+)
+
+
+def numbered_section(index, heading, body):
+    digits = "零一二三四五六七八九"
+
+    def chinese(value):
+        if value < 10:
+            return digits[value]
+        for unit, label in ((1000, "千"), (100, "百"), (10, "十")):
+            if value >= unit:
+                head, tail = divmod(value, unit)
+                prefix = "" if value < 20 and unit == 10 else chinese(head)
+                return prefix + label + (("零" if tail < unit // 10 else "") + chinese(tail) if tail else "")
+
+    heading = re.sub(r"^## ([^\n]+)", lambda match: f"## {chinese(index)}、{TITLE_NUMBER.sub('', match[1])}", heading)
+    counters = []
+    fence = None
+    lines = []
+    for line in body.splitlines():
+        delimiter = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if delimiter:
+            mark, trailing = delimiter.groups()
+            if fence is None:
+                fence = mark
+            elif mark.startswith(fence) and not trailing.strip():
+                fence = None
+        match = re.match(r"^(#{3,6})[ \t]+(.+)$", line) if fence is None else None
+        if match:
+            depth = min(len(match[1]) - 2, len(counters) + 1)
+            del counters[depth:]
+            if len(counters) < depth:
+                counters.append(0)
+            counters[-1] += 1
+            number = ".".join(str(part) for part in [index, *counters])
+            line = f"{match[1]} {number} {TITLE_NUMBER.sub('', match[2])}"
+        lines.append(line)
+    return heading + "\n".join(lines)
+
+
+def grounded_body(text, source, *, source_language="zh"):
     """Remove recurring technical embellishments when absent from evidence.
 
     This complements model review; it is deliberately conservative because the
@@ -87,7 +131,7 @@ def grounded_body(text, source):
     terms = ("风洞", "毫秒级", "疲劳寿命", "非簧载", "非铺装", "热管理", "故障容错", "瞬时扭矩",
              "矢量控制精度", "结构强度", "传感器采集", "小批量试产", "频繁充能", "人体耐受上限", "市售高性能电动车",
              "两个或四个推进器", "多推进器演示", "不同推进器配置", "配置推进器", "推力或质量优化上的不足")
-    unsupported = [term for term in terms if term not in source]
+    unsupported = [term for term in terms if term not in source] if source_language == "zh" else []
     text = re.sub(r"[（(]注[：:][^）)]*[）)]", "", clean_report(text))
     parts = re.split(r"(?<=[。！？；])|(?<=\n)", text)
     result = "".join(part for part in parts if not any(term in part for term in unsupported)
@@ -96,8 +140,10 @@ def grounded_body(text, source):
     result = re.sub(r"(?m)^\s*[（）()，。、；;]+\s*$", "", result)
     # A future speed target is not a measured top speed. Resolve its status
     # from the corresponding source sentence before formatting the report.
-    for sentence in re.split(r"[。！？\n]", source):
-        if re.search(r"目标|计划|预期|未来|希望|应该|将|我想|我认为|可能|你会", sentence):
+    target_words = (r"\b(?:target(?:ing|s)?|aim(?:s|ing)?|plan(?:s|ning)?|expect(?:s|ed)?|hope(?:s)?|projected)\b"
+                    if source_language == "en" else r"目标|计划|预期|未来|希望|应该|将|我想|我认为|可能|你会")
+    for sentence in re.split(r"[。！？\n]|(?<=[.!?])\s+", source):
+        if re.search(target_words, sentence, re.IGNORECASE):
             for number in re.findall(r"\d+(?:\.\d+)?", sentence):
                 result = re.sub(r"(?<!目标)(?:实测)?最高(?:速度|时速)([^。\n]{0,12}" + re.escape(number) + r"(?![\d.]))", r"目标最高速度\1", result)
                 result = re.sub(r"(" + re.escape(number) + r"\s*(?:mph|英里[^，。\n]{0,4})最高速度[：:]\s*)实测值", r"\1目标值", result, flags=re.I)

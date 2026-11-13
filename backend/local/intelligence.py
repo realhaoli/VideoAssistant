@@ -54,6 +54,16 @@ def valid_plan(value):
                     and ch['end'] >= ch['start'] for ch in value['chapters']))
 
 
+def valid_source_draft(value):
+    return (isinstance(value, dict) and isinstance(value.get("body"), str)
+            and isinstance(value.get("facts"), list)
+            and all(isinstance(fact, dict) and isinstance(fact.get("text"), str)
+                    and isinstance(fact.get("quote"), str) and type(fact.get("cue_id")) is int
+                    and all(type(fact.get(key)) in (int, float) and math.isfinite(fact[key])
+                            for key in ("start", "end"))
+                    and 0 <= fact["start"] < fact["end"] for fact in value["facts"]))
+
+
 class Intelligence:
     def __init__(self, config, check, *, checkpoint_dir=None, warning=lambda message: None):
         self.config, self.check = config, check
@@ -145,13 +155,13 @@ class Intelligence:
         raise ModelJSONError(f"{stage}失败，模型两次响应均未返回符合要求的 JSON。可继续处理并复用已完成的检查点",
                              truncated=truncated)
 
-    def checkpoint(self, label, material, generate):
+    def checkpoint(self, label, material, generate, valid=lambda value: isinstance(value, str)):
         self.check()
         if self.checkpoint_dir is None:
             return generate()
         digest = fingerprint(label, self.model_identity(), material)
         path = self.checkpoint_dir / (label + "-" + digest + ".json")
-        saved = read_checkpoint(path, lambda value: isinstance(value, str))
+        saved = read_checkpoint(path, valid)
         if saved is not None:
             return saved
         result = generate()
@@ -625,7 +635,7 @@ class Intelligence:
 每章通常90秒到8分钟（短视频允许更短），按技术主题而非发言顺序切分。不要把开场、场地、主持人致辞、公司历史独立成章，合并到第一个实质技术章节。章节标题15–25字，直接点明技术主题或结论，不能以“背景/介绍/概述/开场”开头。只保留支撑技术结论的背景信息，不为礼貌致辞设章节。
 标题简洁客观，不用“革命性/颠覆/终极彩蛋”等宣传词。summary 直接陈述技术结论和机制，不写“介绍了/提到/表示”。各章summary和points只能来自它对应的字幕区间；计划与实测要区分，未提供的机制或效果不能推断。
 仅返回 JSON：{{"title":"中文技术汇报标题","summary":"核心技术结论","chapters":[{{"title":"技术主题或结论","summary":"50–100字具体结论","start_id":0,"start_quote":"该起始字幕的逐字原文","points":["3–5条机制、参数或结论线索"],"visual_query":"本章最应展示的技术画面"}}]}}。
-每章以素材中的真实字幕 id 指定起点，start_quote 必须复制该条字幕原文，不能以章节序号代替字幕 id。每章要点必须来自其起始 id 至下一章节起始 id 之间。第一章 start_id=0，最后一章覆盖到片尾，按主题转换分章，不能把时间等分或给前面章节每章机械分配一分钟。visual_query 只说明需要解释的内容，不能凭空指定素材里不存在的界面、演示或图表。
+每章以素材中的真实字幕 id 指定起点，start_quote 必须用原语言复制该条字幕原文，不能以章节序号代替字幕 id。每章要点必须来自其起始 id 至下一章节起始 id 之间。第一章 start_id=0，最后一章覆盖到片尾，按主题转换分章，不能把时间等分或给前面章节每章机械分配一分钟。visual_query 只说明需要解释的内容，不能凭空指定素材里不存在的界面、演示或图表。
 素材：{chr(10).join(notes)}"""
 
         def valid_response(value):
@@ -704,16 +714,25 @@ class Intelligence:
             body = self.digest(body)
         def review(items, text):
             self.check()
-            prompt = ("按上传顺序给图片编号0起。请将每张图与以下章节正文联合评审，选择真正能解释正文的原视频画面。"
-                  "按语义相关性、说明价值、可读性排序。优先产品细节、技术示意、数据图、演示或解释正文要点的PPT。无需与配图目标的表现形式完全一致，内容相关且有说明作用即可；避免只有讲者、纯装饰图、模糊图。"
-                  "只保留合适的图片，不要求凑数；全部无关则返回空rankings。图注用简体中文，须同时得到画面与正文支持，不能编造型号、数字或因果结论。"
-                  "仅返回JSON {\"rankings\":[{\"index\":0,\"score\":90,\"reason\":\"为什么能说明该段\",\"caption\":\"中文图注\"}]}。"
-                  "\n章节配图目标：" + str(chapter.get("visual_query", chapter["title"])) + "\n正文：" + text +
+            prompt = ("按上传顺序给图片编号0起。逐图核对画面实际可见的内容，只选择能直接说明待配图段落具体要点的画面。"
+                  "kind 只能是 parameter（可读的参数、价格、仪表或图表）、product（对应的实物或产品细节）、demo（该功能的实际演示、技术示意或界面）。"
+                  "单纯讲者、品牌背景、通用产品宣传图、无关屏幕和模糊画面全部排除。"
+                  "reason 写具体可见的对象或动作，以及它对应的正文要点。单凭字幕能推测的画面不能入选。全部不合适时返回空 rankings。"
+                  "只有对应关系清晰且有说明价值才给80分或以上。parameter 必须在 visible_text 逐字抄录正文中同一参数的可读数值和名称或单位。"
+                  "如果正文同时介绍产品结构、动作和参数，能直接展示其中一个具体要点即可。画面清楚展示对应实物或功能、但没有可读数值时，按 product 或 demo 评估，并用无数值图注说明实际可见的内容。"
+                  "图注使用简体中文，任何数字都必须同时出现在正文和画面可读文字中。"
+                  "仅返回JSON {\"rankings\":[{\"index\":0,\"score\":90,\"kind\":\"parameter\",\"reason\":\"可见内容与对应的正文要点\",\"caption\":\"中文图注\",\"visible_text\":\"可读的原画面文字\"}]}。"
+                  "\n章节配图目标：" + str(chapter.get("visual_query", chapter["title"]))[:300] +
+                  "\n定位字幕：" + str(chapter.get("evidence_text", ""))[:500] + "\n正文：" + text +
                   "\n图片时刻（秒）：" + str([round(c["time"], 2) for _, c in items]))
             try:
                 value = self.chat(prompt, visual=[c['path'] for _,c in items], json_result=True, max_tokens=1800)
-                return [dict(entry, index=items[entry['index']][0]) for entry in value.get('rankings', [])
-                        if isinstance(entry.get('index'),int) and 0 <= entry['index'] < len(items)]
+                rankings = value.get('rankings') if isinstance(value, dict) else None
+                if not isinstance(rankings, list):
+                    raise ModelJSONError("选图结果格式无效")
+                return [dict(entry, index=items[entry['index']][0]) for entry in rankings
+                        if isinstance(entry, dict) and type(entry.get('index')) is int and 0 <= entry['index'] < len(items)
+                        and type(entry.get('score')) in (int, float) and 0 <= entry['score'] <= 100]
             except ModelLimitError:
                 if len(items) > 1:
                     middle = len(items)//2
@@ -724,38 +743,67 @@ class Intelligence:
                         return review(items, compact)
                 raise
         ranked = []
+        def numbers(text):
+            text = re.sub(r"(?<=\d)[,，\u202f](?=\d{3}(?:\D|$))", "", text)
+            return set(re.findall(r"\d+(?:[.,]\d+)*", text))
+
+        body_numbers = numbers(body)
         for entry in review(list(enumerate(candidates)), body):
+            kind = entry.get('kind')
+            visible_numbers = numbers(str(entry.get('visible_text') or ''))
+            if (entry['score'] < 80 or kind not in ('parameter', 'product', 'demo')
+                    or not isinstance(entry.get('reason'), str) or not entry['reason'].strip()
+                    or kind == 'parameter' and not (body_numbers & visible_numbers)):
+                continue
             index = entry['index']
             if index not in [r['index'] for r in ranked]:
                 caption = str(entry.get('caption', ''))
-                if any(number not in re.findall(r"\d+(?:[.,]\d+)*", body) for number in re.findall(r"\d+(?:[.,]\d+)*", caption)):
-                    caption = '原视频画面 · ' + chapter['title']
+                if numbers(caption) - (body_numbers & visible_numbers):
+                    caption = ('与本段对应的原视频画面' if numbers(chapter['title'])
+                               else '原视频画面 · ' + chapter['title'])
                 ranked.append(dict(entry, caption=caption, candidate=candidates[index]))
         return sorted(ranked, key=lambda entry:entry.get('score',0), reverse=True)
 
-    def draft(self, chapter, segments, options, evidence=""):
-        selected = [cue for cue in segments if cue["end"] > chapter["start"] and cue["start"] < chapter["end"]]
+    def draft(self, chapter, segments, options, evidence="", *, source_language="zh"):
+        from_source = source_language != "zh"
+        selected = [dict(cue, cue_id=index) if from_source else cue
+                    for index, cue in enumerate(segments)
+                    if cue["end"] > chapter["start"] and cue["start"] < chapter["end"]]
         batches = self.bounded_segments(selected, 3200)
+
+        def combine(parts):
+            if from_source:
+                return dict(body="\n\n".join(part["body"] for part in parts),
+                            facts=[fact for part in parts for fact in part["facts"]])
+            return "\n\n".join(parts)
+
         def part(batch):
             local = dict(chapter, start=batch[0]["start"], end=batch[-1]["end"])
+
             def generate():
                 try:
+                    if from_source:
+                        return self._draft_small(local, batch, options, evidence, source_language=source_language)
                     return self._draft_small(local, batch, options, evidence)
                 except ModelLimitError:
                     left, right = self.split_batch(batch)
-                    return part(left) + "\n\n" + part(right)
+                    return combine([part(left), part(right)])
                 except ModelTimeoutError as exc:
                     if exc.stage:
                         raise
                     raise ModelTimeoutError("撰写或核对章节正文") from exc
+            if from_source:
+                return self.checkpoint("report-source-part-v1", [source_language, local, batch, options, evidence],
+                                       generate, valid_source_draft)
             return self.checkpoint("report-part-v1", [local, batch, options, evidence], generate)
-        return "\n\n".join(part(batch) for batch in batches)
+        return combine([part(batch) for batch in batches])
 
-    def _draft_small(self, chapter, segments, options, evidence=""):
+    def _draft_small(self, chapter, segments, options, evidence="", *, source_language="zh"):
         from .exports import clean_report
         selected = [(i,s) for i,s in enumerate(segments) if s["end"] > chapter["start"] and s["start"] < chapter["end"]]
+        from_source = source_language != "zh"
         text = "\n".join(f"[#seg_{i:04d} {s['start']:.2f}-{s['end']:.2f}s] {s['text']}" for i,s in selected)
-        if len(text) > 22000:
+        if not from_source and len(text) > 22000:
             facts = []
             for batch in subtitles.chunks([s for _,s in selected], 6000):
                 facts.append(self.chat("提炼中文事实材料，保留重要参数、原始时间、技术机制、限制和计划，不能增加原文没有的事实。\n" + json.dumps(batch, ensure_ascii=False), system=REPORT_SYSTEM, max_tokens=3000))
@@ -763,21 +811,42 @@ class Intelligence:
         facts_prompt = ("围绕技术主题【" + chapter["title"] + "】从逐字稿提取可直接核对的技术事实与结论。开场礼貌、场地和历史不作为独立事实，仅保留理解技术必需的背景。只返回JSON {\"facts\":[{\"text\":\"直接陈述的事实\",\"quote\":\"从材料逐字复制的连续证据\"}]}。"
                         "提取6–18条，覆盖技术机制、规格、实际演示、明确风险与后续计划；没有则省略。证据必须逐字来自原文，不能拼造、补单位或换算。"
                         "只提取材料明确陈述的内容，不把宣传比喻转化为技术机制，不推演系统架构、算法、测试方法或工程计划。\n" + text)
+        if from_source:
+            facts_prompt = ("事实 text 用简体中文，quote 必须从对应字幕逐字摘录并保持原语言。"
+                            "每条事实另加 cue_index 整数，指向证据开始的 #seg_ 编号。"
+                            "引用连续字幕时从 cue_index 所指字幕开始，保留否定、推测、目标和实测的区别。\n"
+                            + facts_prompt)
         extracted = self.report_json("正文事实提取", facts_prompt, lambda value: isinstance(value.get("facts"), list),
                                      system=REPORT_SYSTEM, max_tokens=4500)
         compact = lambda value: re.sub(r"\s+", "", str(value))
         numbers = lambda value: {n.replace(",", "") for n in re.findall(r"\d+(?:[.,]\d+)*", value)}
         raw_text = " ".join(s["text"] for _, s in selected)
         facts = []
+        indexed_cues = [cue for _, cue in selected]
         for fact in extracted["facts"]:
             if not isinstance(fact, dict):
                 continue
             quote, statement = str(fact.get("quote", "")), str(fact.get("text", ""))
-            if len(compact(quote)) >= 4 and compact(quote) in compact(raw_text) and not (numbers(statement) - numbers(quote)):
+            if len(compact(quote)) < 4 or not statement.strip() or numbers(statement) - numbers(quote):
+                continue
+            if from_source:
+                if not re.search(r"[\u3400-\u9fff]", statement):
+                    continue
+                cue_index = fact.get("cue_index")
+                if type(cue_index) is not int or not 0 <= cue_index < len(indexed_cues):
+                    continue
+                cue = indexed_cues[cue_index]
+                window = compact(" ".join(item["text"] for item in indexed_cues[cue_index:cue_index + 4]))
+                offset = window.find(compact(quote))
+                if 0 <= offset < len(compact(cue["text"])):
+                    facts.append(dict(text=statement, quote=quote, cue_id=cue["cue_id"],
+                                      start=cue["start"], end=cue["end"]))
+            elif compact(quote) in compact(raw_text):
                 facts.append({"text": statement, "quote": quote})
+        linked_facts = facts
         # Verbatim source is a safe fallback when an extractor paraphrases quotes.
         if not facts:
-            facts = [{"text": s["text"], "quote": s["text"]} for _, s in selected]
+            facts = [{"quote": s["text"]} if from_source else {"text": s["text"], "quote": s["text"]} for _, s in selected]
         evidence_text = json.dumps(facts, ensure_ascii=False)
         request = f"""把已经过原文匹配的事实材料整理为可独立阅读的技术汇报小节。
 章节主题：{chapter['title']}
@@ -796,12 +865,14 @@ class Intelligence:
 原始材料：{raw_text}
 已核对事实：{evidence_text}
 待编辑正文：{draft}"""
+        if from_source:
+            audit = ("以原语言字幕及原文引文为准核对中文正文，保留原文的否定、目标、计划和实测属性。\n" + audit)
         result = clean_report(self.chat(audit, system=REPORT_SYSTEM, max_tokens=6500))
         # A bounded editorial repair enforces the requested format when a model
         # follows the facts but falls back to a transcript commentary style.
         commentary = r"字幕(?:显示|中|未)|视频(?:提到|介绍|未提供)|(?:主持人|发言者|演示者|演讲者).{0,6}(?:表示|提到|强调)|原始草稿|本章节|本节|经核查"
-        if re.search(commentary, result):
-            result = clean_report(self.chat(audit + "\n上次编辑结果仍有讲话转述或编辑过程说明，请直接改为技术事实与机制，不要重复这些措辞：\n" + result,
+        if re.search(commentary, result) or from_source and not re.search(r"[\u3400-\u9fff]", result):
+            result = clean_report(self.chat(audit + "\n请用简体中文直接陈述技术事实与机制，删去讲话转述和编辑过程说明：\n" + result,
                                             system=REPORT_SYSTEM, max_tokens=6500))
         # Numeric additions such as unit conversions and invented test values
         # are mechanically detectable, and must be repaired before publishing.
@@ -815,11 +886,15 @@ class Intelligence:
             if remaining:
                 # Prefer the already grounded fact sentences over publishing
                 # fabricated numerical claims after a failed repair.
+                if from_source and not linked_facts:
+                    raise ValueError("报告数值无法与原字幕核对，请继续处理")
                 result = "\n\n".join(fact["text"] for fact in facts)
         # Do not expose rows that the editorial contract explicitly excludes.
         result = re.sub(r"(?m)^\|[^\n]*(?:场地|开发地点|历史年|成立年|事件日期|手动驾驶定位)[^\n]*\|\s*$", "", result)
         result = re.sub(r"(?m)^#{1,2}\s+[^\n]*\n?", "", result).strip()
-        return result
+        if from_source and not re.search(r"[\u3400-\u9fff]", result):
+            raise ValueError("模型未返回中文报告正文，请继续处理")
+        return dict(body=result, facts=linked_facts) if from_source else result
 
     def digest(self, text, limit=3500):
         def reduce_piece(piece):

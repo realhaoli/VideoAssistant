@@ -289,7 +289,7 @@ def test_multimodal_payload_reduces_images_and_preserves_original_indices(tmp_pa
     images=[{'path':tmp_path/f'{i}.png','time':i} for i in range(4)]
     def chat(prompt,visual,**kwargs):
         if len(visual)>1:raise ModelLimitError('payload')
-        return {'rankings':[{'index':0,'score':90,'caption':'技术画面'}]}
+        return {'rankings':[{'index':0,'score':90,'kind':'demo','reason':'画面显示设备的运行步骤','caption':'技术画面'}]}
     engine.chat=chat
     ranked=engine.select({'title':'系统','visual_query':'技术'},images,'技术正文')
     assert {r['index'] for r in ranked}==set(range(4))

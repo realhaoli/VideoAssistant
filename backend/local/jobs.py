@@ -264,7 +264,7 @@ class JobStore:
     @staticmethod
     def _update_output_state(job, mode, fields):
         state = job.setdefault('output_states', {}).setdefault(mode, {})
-        phase_changed = fields.get('status') != state.get('status') or fields.get('stage') != state.get('stage')
+        phase_changed = any(key in fields and fields[key] != state.get(key) for key in ('status', 'stage'))
         if phase_changed and fields.get('status') in {'queued', 'running'}:
             fields = dict(fields, stage_started_at=time.time())
         state.update(fields)
@@ -411,7 +411,7 @@ class JobStore:
             return self.history_status() | {
                 'offset': offset,
                 'items': [summary(job) for job in jobs[offset:offset + limit]],
-                'recent': [summary(job) for job in jobs[:6]],
+                'recent': [summary(job) for job in jobs[:25]],
                 'active_count': sum(job['status'] in ACTIVE for job in jobs),
                 'completed_count': sum(job['status'] == 'completed' for job in jobs),
             }

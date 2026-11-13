@@ -3,9 +3,9 @@ import json
 from functools import partial
 import hashlib
 from itertools import islice
+import math
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -15,8 +15,9 @@ from .config import DATA, WHISPER_MODELS, WHISPER_DEVICES
 from . import subtitles
 from .links import LinkDownloader, describe_resource
 from .resources import ASR, DOWNLOADS, FFMPEG, FRAMES, ensure_disk, reserve_disk, setting
+from .runtime import ffmpeg_paths, node_path
 from .stages import Step, drive
-from .storage import atomic_json, atomic_text
+from .storage import atomic_json, atomic_text, fingerprint as cache_fingerprint, read_checkpoint, replace_file
 from .whisper_worker import CudaWhisper, CudaWhisperTimeout, probe_cuda
 
 MODEL_LOCK = threading.Lock()
@@ -30,9 +31,8 @@ CAPTION_SCAN_VERSION = 1
 
 
 def network_options():
-    options = dict(quiet=True, no_warnings=True, noplaylist=True, socket_timeout=30)
-    if shutil.which("node"):
-        options["js_runtimes"] = {"node": {}}
+    options = dict(quiet=True, no_warnings=True, noplaylist=True, socket_timeout=30,
+                   js_runtimes={"node": {"path": node_path()}}, ffmpeg_location=ffmpeg_paths()[0])
     if os.getenv("YTDLP_COOKIES_FILE"):
         options["cookiefile"] = os.environ["YTDLP_COOKIES_FILE"]
     return options
@@ -41,6 +41,9 @@ def network_options():
 def command(args, check=lambda: None, timeout=7200, *, on_poll=None):
     """Bound subprocess runtime, drain stderr to disk and support cancellation."""
     import tempfile
+    if args[0] in ("ffmpeg", "ffprobe"):
+        ffmpeg, ffprobe = ffmpeg_paths()
+        args = [ffmpeg if args[0] == "ffmpeg" else ffprobe, *args[1:]]
     with tempfile.TemporaryFile() as err, tempfile.TemporaryFile() as out:
         proc = subprocess.Popen(args, stdout=out, stderr=err)
         start = time.monotonic()
@@ -575,10 +578,10 @@ def image_quality(path):
     from PIL import Image, ImageFilter, ImageStat
     with Image.open(path) as image:
         gray = image.convert("L").resize((320, 180))
-        brightness = ImageStat.Stat(gray).mean[0]
-        if brightness < 12 or brightness > 248:
+        if ImageStat.Stat(gray).stddev[0] < 2:
             return 0.0
-        return ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).mean[0]
+        edges = gray.filter(ImageFilter.FIND_EDGES).crop((1, 1, 319, 179))
+        return ImageStat.Stat(edges).mean[0]
 
 
 def image_hash(path):
@@ -588,48 +591,129 @@ def image_hash(path):
     return sum((values[y * 17 + x] > values[y * 17 + x + 1]) << (y * 16 + x) for y in range(16) for x in range(16))
 
 
-def candidates(path, chapter, output, index, used, check, *, progress=None):
+def duplicate_frame(fingerprint, hashes):
+    return any((fingerprint ^ previous).bit_count() < 12 for previous in hashes)
+
+
+def scene_samples(path, start, end, check):
+    """Scan a short interval at two frames per second and keep only times."""
+    filters = ("fps=2,scale=480:270,format=gray,scdet,"
+               "metadata=mode=print:key=lavfi.scd.mafd:file=-")
+    log = ffmpeg_command(
+        ["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-i", str(path),
+         "-map", "0:V:0", "-an", "-t", f"{end - start:.3f}", "-vf", filters,
+         "-f", "null", "-"],
+        check, timeout=60,
+    )
+    samples = [(start + float(pts), float(change)) for pts, change in re.findall(
+        r"pts_time:([\d.]+)[^\n]*\n\s*lavfi\.scd\.mafd=([\d.]+)", log)]
+    samples = [(time, change) for time, change in samples if start <= time < end]
+    if not samples:
+        return []
+    scenes = []
+    first = 0
+    for index, (_, change) in enumerate(samples):
+        if index > first and change >= 6:
+            scenes.append(samples[first:index])
+            first = index
+    scenes.append(samples[first:])
+
+    def representative(scene):
+        middle = (scene[0][0] + scene[-1][0]) / 2
+        # Skip the first frame after a cut when a stable frame is available.
+        stable = [item for item in scene if item[1] < 6]
+        return min(stable or scene, key=lambda item: (abs(item[0] - middle), item[1]))[0]
+
+    return [representative(scene) for scene in scenes]
+
+
+def candidates(path, chapter, output, index, used, check, *, progress=None, exclude_times=()):
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tempfile import TemporaryDirectory
+
+    check()
     start, end = chapter["start"], chapter["end"]
     duration = max(.1, end - start)
-    def extract(item):
-        n, timestamp = item
+    stat = path.stat()
+    source_key = cache_fingerprint(path.name, stat.st_size, stat.st_mtime_ns)[:16]
+
+    def eligible_times(times, start, end):
+        bounded = (round(min(end, max(start, time)), 3) for time in times)
+        return list(dict.fromkeys(time for time in bounded
+                                  if all(abs(time - prior) >= .5 for prior in exclude_times)))
+
+    def extract(timestamp):
         check()
-        # Chapter boundaries can change after prompt edits. Include the actual
-        # frame timestamp so a resumed task never relabels an old screenshot.
-        target = output / "images" / f"chapter-{index + 1:02d}-{n + 1}-{round(timestamp * 1000)}.jpg"
+        target = output / "images" / source_key / f"{round(timestamp * 1000)}.jpg"
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             if not target.exists():
-                frame(path, timestamp, target, check)
+                with TemporaryDirectory(dir=target.parent) as directory:
+                    staged = Path(directory) / target.name
+                    frame(path, timestamp, staged, check)
+                    replace_file(staged, target)
             quality = image_quality(target)
             fingerprint = image_hash(target)
-            duplicate = any((fingerprint ^ other).bit_count() < 12 for other in used)
-            return dict(path=target, time=timestamp, quality=quality, hash=fingerprint, duplicate=duplicate)
-        except (RuntimeError, ValueError):
+            if not duplicate_frame(fingerprint, used):
+                return dict(path=target, time=timestamp, quality=quality, hash=fingerprint)
+        except (RuntimeError, TimeoutError, ValueError):
+            check()
             return None
     latest = max(start, end - .08)
-    samples = [min(latest, start + duration * fraction) for fraction in (.04, .17, .30, .43, .56, .69, .82, .94)]
-    available = set(range(len(samples)))
-    for anchor in chapter.get('visual_anchors', [])[:2]:
-        timestamp = min(latest, anchor + .5)
-        nearest = min(available, key=lambda index: (abs(samples[index] - timestamp), index))
-        samples[nearest] = timestamp
-        available.remove(nearest)
-    samples.sort()
+    anchor = chapter.get("evidence_time")
+    scene_times = set()
+    new_scene_times = set()
+    if anchor is None:
+        samples = [min(latest, start + duration * fraction) for fraction in (.04, .17, .30, .43, .56, .69, .82, .94)]
+    else:
+        radius = chapter.get("search_radius", 8)
+        previous_radius = chapter.get("previous_search_radius")
+        low, high = max(start, anchor - radius), min(end, anchor + radius)
+        scene_key = cache_fingerprint("scene-v2", source_key, low, high)[:24]
+        scene_path = output / f"scenes-{scene_key}.json"
+        scenes = read_checkpoint(scene_path, lambda data: isinstance(data, list) and len(data) <= math.ceil((high - low) * 2) + 1
+                                 and all(type(time) in (float, int) and low <= time < high for time in data))
+        if scenes is None:
+            try:
+                scenes = scene_samples(path, low, high, check) if high - low >= .5 else []
+                atomic_json(scene_path, scenes)
+            except (RuntimeError, TimeoutError):
+                check()
+                scenes = []
+        scenes = sorted(eligible_times(scenes, low, min(latest, high)), key=lambda time: abs(time - anchor))
+        scene_times = set(scenes)
+        if previous_radius is None:
+            samples = [*scenes[:5], anchor, anchor - 2, anchor + 2]
+        else:
+            # Fill the expanded area first, then use unseen scenes inside it.
+            new_scenes = [time for time in scenes if abs(time - anchor) > previous_radius]
+            new_scene_times = set(new_scenes)
+            earlier_scenes = [time for time in scenes if time not in new_scene_times]
+            offset = (radius + previous_radius) / 2
+            samples = [*(new_scenes + earlier_scenes)[:6], anchor - offset, anchor + offset]
+        start, latest = low, min(latest, high)
+    samples = eligible_times(samples, start, latest)[:8]
+    if not samples:
+        return []
     images = [None] * len(samples)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(extract, (n, fraction)): n for n, fraction in enumerate(samples)}
+        futures = {pool.submit(extract, timestamp): n for n, timestamp in enumerate(samples)}
         for completed, future in enumerate(as_completed(futures), 1):
             images[futures[future]] = future.result()
             if progress:
                 progress(completed * 100 / len(samples))
-    ranked = sorted((image for image in images if image), key=lambda item: (not item["duplicate"], item["quality"]), reverse=True)
+    ranked = sorted((image for image in images if image and image["quality"] > .4),
+                    key=lambda image: (image["time"] in new_scene_times, image["time"] in scene_times, image["quality"]),
+                    reverse=True)
     diverse = []
+    hashes = []
     for image in ranked:
-        if image["quality"] > .4 and not any((image["hash"] ^ old["hash"]).bit_count() < 12 for old in diverse):
+        if not duplicate_frame(image["hash"], hashes):
             diverse.append(image)
-    return diverse[:4]
+            hashes.append(image["hash"])
+            if len(diverse) == 4:
+                break
+    return diverse
 
 
 def export_video(path, target, details, check, *, caption, english_caption=None, progress):

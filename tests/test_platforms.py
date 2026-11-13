@@ -1,7 +1,6 @@
 """Portable storage and paths, including a non-UTF-8 system locale."""
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import sys
@@ -13,6 +12,7 @@ import pytest
 
 from local import config, paths, pipeline, media
 from local.jobs import JobStore
+from local.runtime import ffmpeg_paths, node_path
 from local.storage import atomic_json
 
 
@@ -76,6 +76,25 @@ def test_subprocess_accepts_paths_with_spaces_and_chinese(tmp_path):
     assert media.command([sys.executable, "-X", "utf8", str(script), "中文参数 with spaces"]).strip() == "中文参数 with spaces"
 
 
+def test_download_and_media_use_python_installed_tools_without_path(tmp_path, monkeypatch):
+    from yt_dlp import YoutubeDL
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    ffmpeg, ffprobe = ffmpeg_paths()
+    assert "ffmpeg version" in media.command(["ffmpeg", "-version"])
+    assert "ffprobe version" in media.command(["ffprobe", "-version"])
+    assert media.command([node_path(), "--version"]).startswith("v24.")
+    options = media.download_options(tmp_path)
+    assert options["ffmpeg_location"] == ffmpeg
+    assert options["js_runtimes"]["node"]["path"] == node_path()
+    with YoutubeDL(options) as downloader:
+        processor = FFmpegPostProcessor(downloader)
+        assert processor.available and processor.probe_available
+        assert Path(processor.executable) == Path(ffmpeg)
+        assert Path(processor.probe_executable) == Path(ffprobe)
+
+
 def test_launcher_can_be_called_from_another_working_directory(tmp_path):
     # --help needs no installed model, browser or running application.
     result = subprocess.run([sys.executable, str(paths.ROOT / "start-local.py"), "--help"],
@@ -88,8 +107,6 @@ def test_launcher_can_be_called_from_another_working_directory(tmp_path):
 def test_real_launcher_serves_from_other_directory_and_cleans_up(tmp_path, development):
     if not (paths.ROOT / "frontend/dist/index.html").is_file():
         pytest.skip("build frontend first")
-    if development and not shutil.which("node"):
-        pytest.skip("Node.js required for Vite")
     def free_port():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -97,7 +114,7 @@ def test_real_launcher_serves_from_other_directory_and_cleans_up(tmp_path, devel
     backend_port, frontend_port = free_port(), free_port()
     working = tmp_path / "其他工作目录 with spaces"
     working.mkdir()
-    env = {**os.environ, "MEDIA_DATA_DIR": str(tmp_path / "运行数据"), "PYTHONUTF8": "1"}
+    env = {**os.environ, "MEDIA_DATA_DIR": str(tmp_path / "运行数据"), "PYTHONUTF8": "1", "PATH": str(tmp_path)}
     command = [sys.executable, str(paths.ROOT / "start-local.py"), "--host", "127.0.0.1", "--port", str(backend_port)]
     if development:
         command += ["--dev", "--frontend-port", str(frontend_port)]
@@ -123,7 +140,8 @@ def test_real_launcher_serves_from_other_directory_and_cleans_up(tmp_path, devel
                 assert response.read() == b"[]"
         finally:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
+                subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             else:
                 process.terminate()

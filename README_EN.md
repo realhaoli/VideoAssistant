@@ -8,6 +8,6 @@ The server listens on `0.0.0.0:8080` with no login. Tasks and files are shared, 
 
 See the maintained [Chinese installation and startup guide](README.md) for setup, usage and limitations.
 
-Windows, macOS and Linux share the `start-local.py` launcher. Use `start-local.cmd` on Windows and `./start-local.sh` on macOS/Linux; append `--dev` for development or `--install-browser` to install Chromium in the configured local data directory. Recreate `.venv`, `node_modules` and browser binaries on each target OS. Target Python 3.12, Node.js 22+, FFmpeg/ffprobe and the OS versions supported by Playwright; Windows requires x64 Python and the Visual C++ runtime.
+Windows, macOS and Linux share the `start-local.py` launcher. Use `start-local.cmd` on Windows or `./start-local.sh` on macOS/Linux. Use `--build-frontend` to install and build the frontend, `--install-browser` to install Chromium, and `--dev` to run the development servers. The Python requirements install yt-dlp, FFmpeg, FFprobe and Node.js into the project environment. Recreate the virtual environment and install Chromium on the target OS. Target Python 3.12 and the OS versions supported by Playwright. Windows requires x64 Python and the Visual C++ runtime.
 
 The platform CI workflow builds and tests on all three operating systems, including real FFmpeg and Chromium PDF exports. Local tests on one system do not establish that all three CI jobs passed.
