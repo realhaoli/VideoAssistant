@@ -422,6 +422,9 @@ def test_model_markdown_wrapper_renders_as_paragraphs_and_table(tmp_path):
 @pytest.mark.parametrize('modes', [['illustrated'], ['text'], ['mindmap'], ['subtitles'], ['download'], ['illustrated','text','mindmap','subtitles','download']])
 def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch, modes):
     from local import pipeline, pdf_export
+    monkeypatch.setattr(pipeline.scene_index, 'build', lambda *args: None)
+    monkeypatch.setattr(pipeline, '_final_figure', lambda folder, path, body, sample, choice, engine, check:
+                        (choice['candidate']['path'].read_bytes(), choice['caption'], False))
     from PIL import Image
     jobs=JobStore(tmp_path/'tasks')
     task=jobs.create(modes=modes,source={'type':'upload','filename':'source.mp4','subtitle':'uploaded.srt'}, options={'clean_subtitles':False},title='技术测试',enqueue=False)
@@ -450,7 +453,7 @@ def test_selected_modes_only_publish_requested_final_files(tmp_path, monkeypatch
     assert {p.name for p in output.iterdir()} == expected|extra
     if 'illustrated' in modes:
         with zipfile.ZipFile(output/'illustrated.zip') as z:
-            assert set(z.namelist()) == {'illustrated.html','illustrated.md','image/cover.jpg','image/chapter-01.jpg'}
+            assert set(z.namelist()) == {'illustrated.html','illustrated.md','image/cover.jpg','image/chapter-01.png'}
         assert all(a.get('download_name')=='illustrated.zip' for a in artifacts if a['name'].startswith('illustrated.'))
         assert '系统示意' in (output/'illustrated.md').read_text(encoding='utf-8')
     if 'text' in modes:

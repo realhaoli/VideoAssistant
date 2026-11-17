@@ -2,6 +2,8 @@
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
@@ -368,6 +370,53 @@ def test_incomplete_download_components_are_never_reused(tmp_path,monkeypatch):
     result=media.download('https://example.test',tmp_path,best=True,audio=False,check=lambda:None,progress=lambda _:None)
     assert called and result.name=='source.mp4'
     assert json.loads((tmp_path/'download-complete.json').read_text(encoding='utf-8'))['best']
+
+
+def test_hls_fetches_fragments_in_parallel_and_keeps_a_complete_video(tmp_path, monkeypatch):
+    origin = tmp_path / 'origin'
+    origin.mkdir()
+    media.command(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=black:size=64x64:rate=2',
+                   '-t', '20', '-c:v', 'libx264', '-g', '2', '-hls_time', '1', '-hls_list_size', '0',
+                   str(origin / 'replay.m3u8')], timeout=30)
+    lock = threading.Lock()
+    active = peak = 0
+
+    class Origin(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal active, peak
+            if not self.path.endswith('.ts'):
+                return super().do_GET()
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(.1)
+                super().do_GET()
+            finally:
+                with lock:
+                    active -= 1
+
+        def log_message(self, *args):
+            pass
+
+    class OriginServer(ThreadingHTTPServer):
+        request_queue_size = 32
+
+    monkeypatch.setenv('DOWNLOAD_FRAGMENT_CONCURRENCY', '16')
+    monkeypatch.setenv('NO_PROXY', '127.0.0.1')
+    assert media.download_options(tmp_path)['concurrent_fragment_downloads'] == 16
+    with OriginServer(('127.0.0.1', 0), partial(Origin, directory=str(origin))) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}/replay.m3u8'
+            result = media.download(url, tmp_path / 'downloads', best=True, audio=False,
+                                    check=lambda: None, progress=lambda value: None)
+        finally:
+            server.shutdown()
+            thread.join(timeout=3)
+    assert 9 <= peak <= 16
+    assert float(media.probe(result)['format']['duration']) == 20
 
 
 def test_ytdlp_merge_uses_cancellable_ffmpeg_and_preserves_components(tmp_path, monkeypatch):

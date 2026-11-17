@@ -26,6 +26,7 @@ import { features } from "./features.js";
 import ModelConnectionFields from "./components/ModelConnectionFields.vue";
 import ModelSettingsActions from "./components/ModelSettingsActions.vue";
 import OutputModes from "./components/OutputModes.vue";
+import ReportStyleSettings from "./components/ReportStyleSettings.vue";
 import TaskActions from "./components/TaskActions.vue";
 
 const view = ref("new"),
@@ -41,6 +42,12 @@ const submitStartedAt = ref(0);
 const nowSeconds = ref(Date.now() / 1000);
 const linkChoice = ref(null);
 const selectedResource = ref(null);
+const reportStyles = ref([]);
+const selectedReportStyle = ref("");
+const defaultReportStyle = computed(() => reportStyles.value.find(style => style.built_in));
+const customReportStyles = computed(() => reportStyles.value.filter(style => !style.built_in));
+const reportStyleBusy = ref(false);
+const usesReportStyle = computed(() => modes.value.includes("illustrated") || modes.value.includes("text"));
 const tasks = ref([]),
   historyTasks = ref([]),
   historyPage = ref(1),
@@ -162,6 +169,13 @@ async function decodeResponse(response) {
 async function api(path, options) {
   return decodeResponse(await request(path, options));
 }
+async function loadReportStyles() {
+  reportStyles.value = await api("/report-styles");
+}
+function reportStyleSaved(saved) {
+  reportStyles.value = [...reportStyles.value.filter(style => style.id !== saved.id), saved]
+    .sort((a, b) => Number(Boolean(b.built_in)) - Number(Boolean(a.built_in)) || a.name.localeCompare(b.name));
+}
 async function conditional(path, previous) {
   const headers = previous?.path === path && previous.etag ? { "If-None-Match": previous.etag } : {};
   const response = await request(path, { headers, cache: "no-store" });
@@ -234,6 +248,7 @@ function clearTaskForm() {
   file.value = null;
   url.value = "";
   modes.value = [];
+  selectedReportStyle.value = "";
   sourceTab.value = "url";
   dragging.value = false;
   if (fileInput.value) fileInput.value.value = "";
@@ -321,6 +336,10 @@ async function confirmResource() {
     linkChoice.value = null;
     await taskSubmitted(task);
   } catch (error) {
+    if (error.status === 409 && linkChoice.value?.payload.options.report_style) {
+      linkChoice.value = null;
+      await loadReportStyles().catch(notifyError);
+    }
     notifyError(error);
   } finally {
     submitting.value = false;
@@ -337,6 +356,10 @@ async function submit() {
   uploadPercent.value = null;
   submitStartedAt.value = Date.now() / 1000;
   const options = {};
+  if (usesReportStyle.value && selectedReportStyle.value) {
+    const style = reportStyles.value.find(item => item.id === selectedReportStyle.value);
+    if (style) options.report_style = { id: style.id, revision: style.revision };
+  }
   try {
     let task;
     if (sourceTab.value === "url") {
@@ -376,12 +399,11 @@ async function submit() {
             return;
           }
           if (xhr.status >= 200 && xhr.status < 300) resolve(result);
-          else
-            reject(
-              new Error(
-                typeof result.detail === "string" ? result.detail : "上传失败",
-              ),
-            );
+          else {
+            const error = new Error(typeof result.detail === "string" ? result.detail : "上传失败");
+            error.status = xhr.status;
+            reject(error);
+          }
         };
         xhr.onerror = () => reject(new Error("上传连接中断，请重试"));
         xhr.send(body);
@@ -389,6 +411,7 @@ async function submit() {
     }
     await taskSubmitted(task);
   } catch (error) {
+    if (error.status === 409 && options.report_style) await loadReportStyles().catch(notifyError);
     notifyError(error);
   } finally {
     checkingLink.value = false;
@@ -435,7 +458,7 @@ async function renameTask(task) {
     if (error !== "cancel" && error !== "close") notifyError(error);
   }
 }
-async function openModels() {
+async function openModels(tab = "llm") {
   if (modelBusy.value) return;
   modelBusy.value = true;
   try {
@@ -443,7 +466,8 @@ async function openModels() {
     models.value = { ...settings.value, llm_api_key: "", subtitle_api_key: "", vlm_api_key: "" };
     modelChecks.value = {};
     capacityResults.value = {};
-    modelTab.value = "llm";
+    modelTab.value = typeof tab === "string" ? tab : "llm";
+    await loadReportStyles().catch(notifyError);
     localRuntime.value = settings.value;
   } catch (error) {
     notifyError(error);
@@ -566,7 +590,7 @@ async function saveModels() {
 let timer, elapsedTimer;
 onMounted(async () => {
   elapsedTimer = setInterval(() => { nowSeconds.value = Date.now() / 1000; }, 1000);
-  await Promise.all([refresh(), loadSettings()]);
+  await Promise.all([refresh(), loadSettings(), loadReportStyles().catch(notifyError)]);
   let idleTicks = 0;
   timer = setInterval(() => {
     if (document.hidden) return;
@@ -622,7 +646,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="sidebar-bottom">
         <button class="nav-item settings-link" @click="openModels">
-          <el-icon><Setting /></el-icon>模型设置
+          <el-icon><Setting /></el-icon>设置
         </button>
         <div class="sidebar-version">本地运行</div>
       </div>
@@ -772,6 +796,14 @@ onBeforeUnmount(() => {
               </span>
             </button>
           </div>
+          <div v-if="usesReportStyle" class="report-style-picker">
+            <label for="report-style">报告风格</label>
+            <select id="report-style" v-model="selectedReportStyle" :disabled="submitting">
+              <option value="">{{ defaultReportStyle?.name || "视频详细流程（默认）" }}</option>
+              <option v-for="style in customReportStyles" :key="style.id" :value="style.id">{{ style.name }}</option>
+            </select>
+            <button class="text-button" :disabled="submitting" @click="openModels('report')">管理风格</button>
+          </div>
           <p class="timing-note">耗时为参考预估，不含排队；实际随设备、字幕、网速和模型速度变化。</p>
           <div v-if="submitting" class="upload-progress" role="status">
             <span>{{ submissionProgressText }}</span>
@@ -883,6 +915,9 @@ onBeforeUnmount(() => {
         <div class="page-heading">
           <div>
             <div class="eyebrow"><OutputModes :ids="activeTask.modes" /></div>
+            <p v-if="activeTask.options?.report_style" class="muted task-report-style">
+              报告风格 · {{ activeTask.options.report_style.name }}
+            </p>
             <h1>{{ activeTask.custom_title || activeTask.report_title || activeTask.title }}</h1>
             <p class="muted">
               {{ date(activeTask.created_at)
@@ -942,7 +977,9 @@ onBeforeUnmount(() => {
                 <h2>生成文件</h2>
                 <span class="muted">{{ orderedArtifacts.length }} 项</span>
               </div>
-              <span class="local-text">本地保存</span>
+              <a v-if="activeTask.scene_index_ready" class="text-button"
+                :href="`/api/v1/tasks/${activeTask.id}/scenes`" target="_blank" rel="noopener">场景缩略图</a>
+              <span v-else class="local-text">本地保存</span>
             </div>
             <p v-if="!activeTask.artifacts.length" class="muted result-wait">
               等待文件生成
@@ -1025,7 +1062,7 @@ onBeforeUnmount(() => {
         </button>
       </template>
     </ElDialog>
-    <div v-if="models" class="modal-backdrop" @click.self="!modelBusy && (models = null)">
+    <div v-if="models" class="modal-backdrop" @click.self="!modelBusy && !reportStyleBusy && (models = null)">
       <section
         class="model-dialog"
         role="dialog"
@@ -1033,11 +1070,11 @@ onBeforeUnmount(() => {
         aria-labelledby="model-title"
       >
         <div class="section-heading">
-          <h2 id="model-title">模型设置</h2>
+          <h2 id="model-title">设置</h2>
           <button
             class="icon-button"
-            aria-label="关闭模型设置"
-            :disabled="modelBusy"
+            aria-label="关闭设置"
+            :disabled="modelBusy || reportStyleBusy"
             @click="models = null"
           >
             <el-icon><Close /></el-icon>
@@ -1127,9 +1164,14 @@ onBeforeUnmount(() => {
               }}</span>
             </div>
           </ElTabPane>
+          <ElTabPane label="报告风格" name="report" lazy>
+            <ReportStyleSettings :styles="reportStyles" :request="api"
+              @saved="reportStyleSaved" @busy="reportStyleBusy = $event" />
+          </ElTabPane>
         </ElTabs>
         <p class="model-shared-note">当前配置为所有用户共用，谨慎修改</p>
         <ModelSettingsActions
+          v-if="modelTab !== 'report'"
           :busy="modelBusy"
           :saving="savingModels"
           :result="modelChecks[modelTab]"

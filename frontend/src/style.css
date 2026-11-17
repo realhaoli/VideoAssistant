@@ -511,6 +511,9 @@ input[type="checkbox"] {
   line-height: 1.6;
   color: #73767a;
 }
+.report-style-picker + .timing-note {
+  margin-top: 14px;
+}
 .feature-card:hover {
   border-color: #a0cfff;
 }
@@ -981,10 +984,25 @@ input[type="checkbox"] {
   margin-bottom: 14px;
 }
 .model-dialog label input,
-.model-dialog label select {
+.model-dialog label select,
+.model-dialog label textarea {
   display: block;
   margin-top: 8px;
 }
+.model-dialog textarea { resize: vertical; }
+.report-style-picker { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.report-style-picker label { font-size: 13px; font-weight: 600; }
+.report-style-picker select { width: min(240px, 100%); }
+.report-style-preview { padding: 12px 14px; background: #f5f7fa; border-radius: 4px; overflow-wrap: anywhere; }
+.report-style-preview p, .report-style-preview ol { margin: 8px 0; }
+.report-style-prompt { white-space: pre-wrap; }
+.report-style-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.report-style-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 4px 0 14px; }
+.report-style-list { list-style: none; margin: 0; padding: 0; }
+.report-style-list li + li { border-top: 1px solid var(--line); }
+.report-style-list button { display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%; padding: 12px; text-align: left; }
+.report-style-list button:hover { background: #f5f7fa; }
+.report-style-list small { display: block; color: #606266; margin-top: 4px; }
 .model-two {
   display: grid;
   grid-template-columns: 1fr 1fr;

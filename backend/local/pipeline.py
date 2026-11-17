@@ -5,8 +5,9 @@ import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from . import config, exports, media, subtitles, pdf_export
+from . import config, exports, media, scene_index, subtitles, pdf_export, report_styles, styled_report
 from .intelligence import Intelligence
 from .output_progress import OutputProgress
 from .report_prompts import VERSION
@@ -58,6 +59,10 @@ def steps(store, job_id, *, inline=False):
     check = lambda: store.check(job_id)
     warn = lambda message: store.warn(job_id, message)
     modes, options = set(job["modes"]), job["options"]
+    report_style = options.get('report_style') or {}
+    if report_style.get('id') == report_styles.DEFAULT_STYLE['id'] and not report_style.get('rules'):
+        # The preset records the user's choice without changing the original report pipeline or cache keys.
+        options = {key: value for key, value in options.items() if key != 'report_style'}
     exports.recover_report_installs(folder)
     exports.normalize_outputs(folder, modes)
     model_settings = store.settings(job_id)
@@ -356,13 +361,30 @@ def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence
         return errors
 
     report_modes = modes & {'text', 'illustrated', 'mindmap'}
-    if report_modes:
-        cache_dir = model_cache / f'report-{fingerprint(cues, options, metadata)[:24]}'
-        if language != 'zh':
-            cache_dir = model_cache / f'report-source-{fingerprint(language, cues, options, metadata)[:24]}'
-        report = partial(_report_outputs, store, job_id, folder, output, report_modes, options,
-                         intelligence, cues, language, metadata, media_path, check, warn, tracker, cache_dir, shared_video)
-        work.append(Step('outputs', partial(produce, report_modes, report)))
+    style = options.get("report_style")
+    styled_modes = report_modes & {'text', 'illustrated'} if style else set()
+    separate_map = bool(style and 'mindmap' in report_modes)
+    if separate_map and styled_modes:
+        for phase in ('chapters', 'report'):
+            tracker.weights['map_' + phase] = tracker.weights[phase]
+        tracker.configure(chapters=styled_modes, report=styled_modes,
+                          map_chapters={'mindmap'}, map_report={'mindmap'})
+
+    def add_report(selected, report_options, *, map_only=False, publish_title=True):
+        if not selected:
+            return
+        namespace = 'report' if language == 'zh' else 'report-source'
+        key = fingerprint(cues, report_options, metadata) if language == 'zh' else fingerprint(language, cues, report_options, metadata)
+        cache_dir = model_cache / f'{namespace}-{key[:24]}'
+        report = partial(_report_outputs, store, job_id, folder, output, selected, report_options,
+                         intelligence, cues, language, metadata, media_path, check, warn, tracker, cache_dir,
+                         shared_video, map_only=map_only, publish_title=publish_title)
+        work.append(Step('outputs', partial(produce, selected, report)))
+
+    add_report(styled_modes, options)
+    plain_options = {key: value for key, value in options.items() if key != "report_style"}
+    add_report(report_modes - styled_modes, plain_options, map_only=bool(styled_modes) and separate_map,
+               publish_title=not separate_map)
 
     caption_modes = modes & {'subtitles', 'download'}
     if caption_modes:
@@ -415,59 +437,83 @@ def _deliver_outputs(store, job_id, folder, output, modes, options, intelligence
 
 
 def _report_outputs(store, job_id, folder, output, modes, options, intelligence, cues, language, metadata, media_path,
-                    check, warn, tracker, cache_dir, shared_video):
+                    check, warn, tracker, cache_dir, shared_video, *, map_only=False, publish_title=True):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    tracker("chapters", "按完整内容组织中文汇报章节")
-    plan = intelligence.plan(cues, metadata["duration"], options, metadata, cache_dir / f"plan-{VERSION}.json",
-                             lambda p: tracker("chapters", "规划章节并核对窗口边界", p * 100))
-    tracker.complete("chapters")
-    plan = dict(plan, title=subtitles.simplified(plan['title']), chapters=[
-        dict(chapter, title=subtitles.simplified(chapter['title']))
-        for chapter in plan['chapters']
-    ])
-    store.update(job_id, report_title=plan["title"])
-    atomic_json(folder / 'chapters.json', plan)
-    chapters = plan['chapters']
-    sections, figure_evidence = [], {}
-    tracker('report', f'已完成 0/{len(chapters)} 章正文', 0)
-    for index, chapter in enumerate(chapters):
-        check()
-        if language == 'zh':
-            draft_path = cache_dir / f'draft-{index}-{fingerprint(chapter)[:24]}.md'
-            try:
-                body = draft_path.read_text(encoding='utf-8')
-            except (FileNotFoundError, UnicodeDecodeError):
-                body = intelligence.draft(chapter, cues, options)
-                body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
-                atomic_text(draft_path, body)
-            evidence = "\n".join(cue['text'] for cue in cues
-                                 if cue['end'] > chapter['start'] and cue['start'] < chapter['end'])
-            body = exports.grounded_body(subtitles.simplified(body), evidence)
-        else:
-            draft = intelligence.draft(chapter, cues, options, source_language=language)
-            evidence = "\n".join(fact['quote'] for fact in draft['facts'])
-            body = exports.grounded_body(subtitles.simplified(draft['body']), evidence, source_language=language)
-            figure_evidence[index] = draft['facts']
-        body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
-        body = re.sub(r"(?m)^#{1,2}\s+[^\n]*\n?", "", body).strip()
-        body = re.sub(r"\n+\s*[（(]注[:：]\s*(?:已删除|已核查|已修订|已去除|已移除)[\s\S]*?[）)]\s*$", "", body).strip()
-        start = subtitles.stamp(chapter['start']).split(',')[0]
-        end = subtitles.stamp(chapter['end']).split(',')[0]
-        heading = f"## {chapter['title']}\n\n*{start} — {end}*\n\n"
-        sections.append((chapter, heading, body))
-        fraction = (index + 1) / len(chapters)
-        tracker('report', f'已完成 {index + 1}/{len(chapters)} 章正文', fraction * 100)
+    def report_phase(phase, message, percent=None):
+        tracker(phase, message, percent, phase=f'map_{phase}' if map_only else phase)
+
+    style = options.get("report_style")
+    if style:
+        report_title, sections, figure_evidence, introduction, visuals = styled_report.build(
+            intelligence, cues, metadata, options, cache_dir, tracker)
+        store.update(job_id, report_title=subtitles.simplified(report_title))
+    else:
+        introduction, visuals = "", ""
+
+        report_phase("chapters", "按完整内容组织中文汇报章节")
+        plan = intelligence.plan(cues, metadata["duration"], options, metadata, cache_dir / f"plan-{VERSION}.json",
+                                 lambda p: report_phase("chapters", "规划章节并核对窗口边界", p * 100))
+        tracker.complete("map_chapters" if map_only else "chapters")
+        plan = dict(plan, title=subtitles.simplified(plan['title']), chapters=[
+            dict(chapter, title=subtitles.simplified(chapter['title']))
+            for chapter in plan['chapters']
+        ])
+        report_title = plan['title']
+        if publish_title:
+            store.update(job_id, report_title=report_title)
+        atomic_json(folder / 'chapters.json', plan)
+        chapters = plan['chapters']
+        sections, figure_evidence = [], {}
+        report_phase('report', f'已完成 0/{len(chapters)} 章正文', 0)
+        for index, chapter in enumerate(chapters):
+            check()
+            if language == 'zh':
+                draft_path = cache_dir / f'draft-{index}-{fingerprint(chapter)[:24]}.md'
+                try:
+                    body = draft_path.read_text(encoding='utf-8')
+                except (FileNotFoundError, UnicodeDecodeError):
+                    body = intelligence.draft(chapter, cues, options)
+                    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+                    atomic_text(draft_path, body)
+                evidence = "\n".join(cue['text'] for cue in cues
+                                     if cue['end'] > chapter['start'] and cue['start'] < chapter['end'])
+                body = exports.grounded_body(subtitles.simplified(body), evidence)
+            else:
+                draft = intelligence.draft(chapter, cues, options, source_language=language)
+                evidence = "\n".join(fact['quote'] for fact in draft['facts'])
+                body = exports.grounded_body(subtitles.simplified(draft['body']), evidence, source_language=language)
+                figure_evidence[index] = draft['facts']
+            body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+            body = re.sub(r"(?m)^#{1,2}\s+[^\n]*\n?", "", body).strip()
+            body = re.sub(r"\n+\s*[（(]注[:：]\s*(?:已删除|已核查|已修订|已去除|已移除)[\s\S]*?[）)]\s*$", "", body).strip()
+            start = subtitles.stamp(chapter['start']).split(',')[0]
+            end = subtitles.stamp(chapter['end']).split(',')[0]
+            heading = f"## {chapter['title']}\n\n*{start} — {end}*\n\n"
+            sections.append((chapter, heading, body))
+            fraction = (index + 1) / len(chapters)
+            report_phase('report', f'已完成 {index + 1}/{len(chapters)} 章正文', fraction * 100)
 
     report_modes = modes & {'text', 'illustrated'}
-    title = re.sub(r"[<>\n]", "", str(plan['title']))
+    title = re.sub(r"[<>\r\n]", "", str(report_title))
     table_of_contents = "**目录**\n\n[TOC]\n\n"
     base_lead = f"# {title}\n\n" + table_of_contents
 
     def summarize():
         tracker('overview', '提炼技术结论与关键数据', visible=report_modes & {'text'})
-        overview = cached(cache_dir / f'overview-{fingerprint(sections)[:24]}.json',
-                          lambda: intelligence.overview([(chapter, body) for chapter, _, body in sections]),
+        if introduction or style and style["rules"].get("introduction"):
+            tracker.complete('overview')
+            lead = f"# {title}\n\n"
+            if introduction:
+                label = re.sub(r"[<>\r\n]", "", style["rules"].get("introduction_title", "前文"))
+                lead += f"## {label}\n\n{introduction}\n\n"
+            return lead + table_of_contents, ""
+        materials = [(chapter, body) for chapter, _, body in sections]
+        overview_rules = style["rules"]["writing"] if style else ""
+        overview = cached(cache_dir / f'overview-{fingerprint(sections, overview_rules)[:24]}.json'
+                          if style else cache_dir / f'overview-{fingerprint(sections)[:24]}.json',
+                          lambda: intelligence.overview(materials, writing=overview_rules)
+                          if overview_rules else intelligence.overview(materials),
                           valid_overview)
         tracker.complete('overview')
         lead = f"# {title}\n\n**一句话总结：** {subtitles.simplified(overview['one_sentence'])}\n\n"
@@ -532,7 +578,11 @@ def _report_outputs(store, job_id, folder, output, modes, options, intelligence,
         if 'illustrated' in modes:
             def illustrated():
                 body, cover = _illustrate(folder, output, sections, intelligence, media_path, metadata,
-                                         check, warn, tracker, shared_video, cache_dir, cues, figure_evidence)
+                                         check, warn, tracker, shared_video, cache_dir, cues, figure_evidence,
+                                         visual_rules=visuals,
+                                         annotate=bool(style and style["rules"].get("annotate_figures")))
+                if (folder / 'scene-index' / 'index.json').is_file():
+                    store.update(job_id, scene_index_ready=True)
                 deliver_report('illustrated', body, cover=cover)
 
             futures[pool.submit(produce, 'illustrated', illustrated)] = 'illustrated'
@@ -564,6 +614,7 @@ VISUAL_NUMBER = re.compile(
 VISUAL_HEADING = re.compile(r"(?m)^#{3,6}[ \t]+(.+)")
 NON_VISUAL_CONTEXT = re.compile(r"^(?:风险与限制|后续计划)")
 FIGURE_SEARCH_RADII = (8, 24, 48)
+PARAMETER_VIEW = re.compile(r"(?:价格|售价|参数)(?:表|页)|表格|仪表|读数|屏显|(?:0\s*(?:[-–—到至]|to)\s*60\b)", re.I)
 
 
 def _evidence_terms(text):
@@ -647,7 +698,8 @@ def _illustration_targets(chapter, body, cues, check):
     return blocks, sorted(selected)
 
 
-def _illustrate(folder, output, sections, intelligence, media_path, metadata, check, warn, progress, shared_video, cache_dir, source_cues, figure_evidence):
+def _illustrate(folder, output, sections, intelligence, media_path, metadata, check, warn, progress,
+                shared_video, cache_dir, source_cues, figure_evidence, *, visual_rules="", annotate=False):
     if shared_video is not None:
         progress('waiting_video', '等待配图素材', phase='download', visible={'illustrated'})
         media_path = shared_video()
@@ -673,35 +725,60 @@ def _illustrate(folder, output, sections, intelligence, media_path, metadata, ch
     media_stat = media_path.stat()
     visual_config = (intelligence.config.get('use_vlm', True), intelligence.model_identity(visual=True))
     media_identity = (media_path.name, media_stat.st_size, media_stat.st_mtime_ns)
+    catalog = None
+    indexed = False
     cue_start = 0
     for index, (chapter, heading, body) in enumerate(sections):
         check()
-        while cue_start < len(source_cues) and source_cues[cue_start]["end"] <= chapter["start"]:
-            cue_start += 1
-        cue_end = cue_start
-        while cue_end < len(source_cues) and source_cues[cue_end]["start"] < chapter["end"]:
-            cue_end += 1
-        cues = (figure_evidence[index] if index in figure_evidence else
-                [cue for cue in source_cues[cue_start:cue_end] if cue["end"] > chapter["start"]])
+        if index in figure_evidence:
+            cues = figure_evidence[index]
+        else:
+            while cue_start < len(source_cues) and source_cues[cue_start]["end"] <= chapter["start"]:
+                cue_start += 1
+            cue_end = cue_start
+            while cue_end < len(source_cues) and source_cues[cue_end]["start"] < chapter["end"]:
+                cue_end += 1
+            cues = [cue for cue in source_cues[cue_start:cue_end] if cue["end"] > chapter["start"]]
         blocks, targets = _illustration_targets(chapter, body, cues, check)
+        if targets and not indexed and visual_config[0]:
+            indexed = True
+            progress('illustrated_index', '扫描视频场景', 0, phase='illustrate', fraction=0)
+            try:
+                catalog = scene_index.build(media_path, metadata["duration"], folder / 'scene-index',
+                                            media.ffmpeg_command, check,
+                                            lambda percent: progress('illustrated_index', '扫描视频场景', percent,
+                                                                     phase='illustrate', fraction=0))
+            except (RuntimeError, OSError, ValueError):
+                check()
+                warn('场景索引生成失败，使用字幕附近的候选画面')
+            else:
+                if catalog is not None and not catalog.scenes:
+                    catalog = None
         for part, (position, evidence) in enumerate(targets):
             sample = dict(chapter, start=max(0, chapter["start"] - FIGURE_SEARCH_RADII[-1]),
                           end=min(metadata["duration"], chapter["end"] + FIGURE_SEARCH_RADII[-1]),
                           evidence_time=max(chapter["start"], evidence["start"]),
                           evidence_text=evidence.get("quote", evidence["text"])[:500])
+            if visual_rules:
+                sample["visual_rules"] = visual_rules
             if "cue_id" in evidence:
                 sample["evidence_cue_id"] = evidence["cue_id"]
             paragraph = blocks[position]
+            if ("|" in paragraph and "参数" in paragraph) or PARAMETER_VIEW.search(paragraph):
+                sample["figure_kind"] = "parameter"
+            elif re.search(r"(?:演示|倒挂|点火|翻滚|起飞|开门)", paragraph):
+                sample["figure_kind"] = "demo"
+            sample["annotate"] = annotate
             chapter_label = f'第 {index + 1}/{len(sections)} 章'
             if len(targets) > 1:
                 chapter_label += f'第 {part + 1}/{len(targets)} 个配图要点'
             chapter_progress = (index + part / len(targets)) / len(sections)
             name = f'chapter-{index + 1:02d}' + (f'-{part + 1:02d}' if len(targets) > 1 else '')
-            relative = f'image/{name}.jpg'
-            cache_key = fingerprint('frame-choice-v5', sample, paragraph, position, used, visual_config, media_identity)[:24]
+            relative = f'image/{name}.png'
+            cache_key = fingerprint('frame-choice-v6', sample, paragraph, position, used, visual_config, media_identity)[:24]
             selection = _chapter_figure(folder, output, media_path, sample, paragraph, intelligence, index, used, check,
                                         warn, progress, chapter_label, chapter_progress, relative,
-                                        cache_dir / f'figure-{cache_key}.json')
+                                        cache_dir / f'figure-{cache_key}.json', catalog=catalog)
             if selection:
                 used.append(selection['hash'])
                 entry = selection['entry']
@@ -718,11 +795,11 @@ def _illustrate(folder, output, sections, intelligence, media_path, metadata, ch
 
 
 def _chapter_figure(folder, output, media_path, chapter, body, intelligence, index, used, check, warn,
-                    progress, label, percent, relative, checkpoint):
+                    progress, label, percent, relative, checkpoint, *, catalog=None):
     target = output / relative
 
     def image_variant(digest):
-        return f'{relative.removesuffix(".jpg")}-{digest[:16]}.jpg'
+        return f'{relative.removesuffix(".png")}-{digest[:16]}.png'
 
     def valid(value):
         if not isinstance(value, dict) or 'entry' not in value:
@@ -752,6 +829,8 @@ def _chapter_figure(folder, output, media_path, chapter, body, intelligence, ind
     seen_hashes = list(used)
     seen_times = []
     choice = None
+    content = None
+    cache_negative = True
     previous_radius = None
     for attempt, radius in enumerate(FIGURE_SEARCH_RADII, 1):
         round_label = f'{label}第 {attempt}/{len(FIGURE_SEARCH_RADII)} 轮'
@@ -762,8 +841,25 @@ def _chapter_figure(folder, output, media_path, chapter, body, intelligence, ind
         sample = dict(chapter, search_radius=radius, previous_search_radius=previous_radius)
         previous_radius = radius
         frame_progress(0)
+        scenes = None
+        if catalog is not None and attempt == len(FIGURE_SEARCH_RADII):
+            options = catalog.shortlist(sample['evidence_time'], sample.get('figure_kind'), seen_times)
+            if options:
+                progress('illustrated_review', f'{round_label}核对场景缩略图', phase='illustrate', fraction=percent)
+                try:
+                    with TemporaryDirectory(dir=folder) as directory:
+                        sheet = catalog.sheet(options, Path(directory) / 'scenes.jpg')
+                        scenes = intelligence.shortlist_scenes(sheet, options, body, sample.get('figure_kind'))
+                except (Cancelled, ServiceStopping):
+                    raise
+                except Exception:
+                    check()
+                    cache_negative = False
+                    warn(f'{label}场景初筛暂不可用，继续核对本地候选')
+                if not scenes:
+                    scenes = None
         candidates = media.candidates(media_path, sample, folder / f'frames-{VERSION}', index, seen_hashes, check,
-                                      progress=frame_progress, exclude_times=seen_times)
+                                      progress=frame_progress, exclude_times=seen_times, catalog=catalog, scenes=scenes)
         images = []
         for image in candidates:
             if not media.duplicate_frame(image['hash'], seen_hashes):
@@ -782,16 +878,28 @@ def _chapter_figure(folder, output, media_path, chapter, body, intelligence, ind
             warn(f'{label}视觉评选不可用，已省略配图：{type(exc).__name__}')
             return None
         if ranked:
-            choice = ranked[0]
-            break
+            selected = ranked[0]
+            progress('illustrated_review', f'{round_label}复核原分辨率配图', phase='illustrate', fraction=percent)
+            try:
+                final = _final_figure(folder, media_path, body, sample, selected, intelligence, check)
+            except (Cancelled, ServiceStopping):
+                raise
+            except Exception as exc:
+                check()
+                cache_negative = False
+                warn(f'{label}原图复核暂不可用：{type(exc).__name__}')
+                continue
+            if final is not None:
+                content, caption, annotated = final
+                choice = dict(selected, caption=caption, annotated=annotated)
+                break
 
     if choice is None:
         warn(f'{label}没有清晰、相关且不重复的画面，未强行插图')
-        if seen_times:
+        if seen_times and cache_negative:
             atomic_json(checkpoint, {'entry': None})
         return None
     selected = choice['candidate']
-    content = Path(selected['path']).read_bytes()
     digest = sha256(content).hexdigest()
     if target.is_file() and sha256(target.read_bytes()).hexdigest() != digest:
         relative = image_variant(digest)
@@ -799,6 +907,8 @@ def _chapter_figure(folder, output, media_path, chapter, body, intelligence, ind
     if not target.is_file():
         atomic_bytes(target, content)
     caption = re.sub(r"[\[\]<>\n]", "", subtitles.simplified(str(choice.get('caption') or chapter['title'])))
+    if choice['annotated']:
+        caption = "① " + caption
     entry = dict(chapter=chapter['title'], image=relative, time=selected['time'], caption=caption,
                  reason=choice.get('reason', ''), score=choice.get('score'))
     if "evidence_time" in chapter:
@@ -808,6 +918,30 @@ def _chapter_figure(folder, output, media_path, chapter, body, intelligence, ind
     result = {'entry': entry, 'hash': selected['hash'], 'digest': digest}
     atomic_json(checkpoint, result)
     return result
+
+
+def _final_figure(folder, media_path, body, sample, choice, intelligence, check):
+    with TemporaryDirectory(dir=folder) as directory:
+        original = Path(directory) / 'original.png'
+        media.frame(media_path, choice['candidate']['time'], original, check, native=True)
+        annotation = sample['annotate']
+        request_region = annotation or choice['kind'] == 'parameter'
+        review = intelligence.verify_figure(original, body, sample, choice, request_region=request_region)
+        if review is None:
+            return None
+        if request_region:
+            cropped = original.with_name('focused.png')
+            try:
+                if media.focus_frame(original, cropped, review.get('box'), annotate=annotation):
+                    checked = intelligence.verify_figure(cropped, body, sample,
+                                                         dict(choice, caption=review['caption']))
+                    if checked is not None:
+                        return cropped.read_bytes(), checked['caption'], annotation
+            except (Cancelled, ServiceStopping):
+                raise
+            except Exception:
+                check()
+        return original.read_bytes(), review['caption'], False
 
 
 def _video_output(store, job_id, folder, output, path, details, check, progress, shared_video, english_caption):

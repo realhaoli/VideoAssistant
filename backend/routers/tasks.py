@@ -1,3 +1,4 @@
+import base64
 import json
 import errno
 import hashlib
@@ -16,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel, Field
 from yt_dlp.utils import DownloadError, UnsupportedError
 
-from local import config
+from local import config, report_styles, scene_index
 from local.jobs import ACTIVE, Cancelled, TaskCapacityError, store
 from local.media import MEDIA_EXTS, preview_link
 from local.storage import atomic_bytes, path_lock, replace_file
@@ -37,6 +38,7 @@ class Options(BaseModel):
     clean_subtitles: bool = True
     scenario: str = "auto"
     instructions: str = Field("", max_length=2500)
+    report_style: report_styles.StyleSelection | None = None
 
 
 class LinkCheck(BaseModel):
@@ -84,6 +86,44 @@ def settings(whisper_model: str | None = None):
     except RuntimeError:
         ffmpeg_available = False
     return values | {"ffmpeg_available": ffmpeg_available, **whisper_status(model)}
+
+
+@secured.get("/report-styles")
+def report_style_list():
+    return report_styles.list_styles()
+
+
+@secured.post("/report-styles/parse")
+def report_style_parse(body: report_styles.StyleDraft):
+    from local.intelligence import Intelligence
+    from local.model_client import ModelLimitError, ModelTimeoutError
+
+    values = config.load()
+    try:
+        return report_styles.parse_style(Intelligence(values, lambda: None), body)
+    except (ModelLimitError, ModelTimeoutError, ValueError) as exc:
+        raise HTTPException(422, config.redact(str(exc), settings=values)[:500]) from exc
+    except Exception as exc:
+        raise HTTPException(502, "解析报告风格失败，请检查大语言模型连接后重试") from exc
+
+
+def _save_report_style(style_id, body):
+    try:
+        return report_styles.save_style(style_id, body)
+    except report_styles.StyleConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@secured.post("/report-styles", status_code=201)
+def report_style_create(body: report_styles.StyleSave):
+    return _save_report_style(None, body)
+
+
+@secured.put("/report-styles/{style_id}")
+def report_style_update(style_id: report_styles.StyleId, body: report_styles.StyleSave):
+    return _save_report_style(style_id, body)
 
 
 class ModelSettings(BaseModel):
@@ -346,9 +386,12 @@ def create_link(body: LinkTask):
     if body.resource_id:
         source["resource_id"] = body.resource_id
     try:
-        return store.create(modes=body.modes, source=source, options=body.options.model_dump(), title=parsed.hostname)
+        options = report_styles.task_options(body.options, body.modes)
+        return store.create(modes=body.modes, source=source, options=options, title=parsed.hostname)
     except TaskCapacityError as exc:
         raise HTTPException(429, str(exc)) from exc
+    except report_styles.StyleConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -379,7 +422,7 @@ def _save_upload(request, file, modes, options, subtitle, release_slot):
         chosen = json.loads(modes)
         if not isinstance(chosen, list):
             raise ValueError("功能选项格式错误")
-        opts = Options(**json.loads(options)).model_dump()
+        opts = report_styles.task_options(Options(**json.loads(options)), chosen)
         source = {"type": "upload", "filename": "source" + suffix, "original_name": Path(file.filename).name}
         if subtitle:
             sub_suffix = Path(subtitle.filename or "").suffix.lower()
@@ -392,6 +435,8 @@ def _save_upload(request, file, modes, options, subtitle, release_slot):
                                enqueue=False, upload_pending=True)
     except TaskCapacityError:
         raise
+    except report_styles.StyleConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc))
     except OSError as exc:
@@ -572,6 +617,29 @@ def video_subtitle(job_id: str, index: int):
                                        '-c:s', 'webvtt', '-f', 'webvtt', 'pipe:1'], timeout=60).encode('utf-8')
                 atomic_bytes(cache, content)
     return Response(content, media_type='text/vtt', headers={'X-Content-Type-Options': 'nosniff'})
+
+
+@secured.get("/tasks/{job_id}/scenes", response_class=HTMLResponse)
+def report_scenes(job_id: str, page: int = Query(default=1, ge=1)):
+    catalog = scene_index.load(job_directory(job_id) / "scene-index")
+    page_size = 25
+    total = (len(catalog.scenes) + page_size - 1) // page_size if catalog else 0
+    if page > total:
+        raise HTTPException(404, "场景缩略图尚未生成")
+    offset = (page - 1) * page_size
+    try:
+        sheet = base64.b64encode(catalog.montage(catalog.scenes[offset:offset + page_size])).decode("ascii")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "场景缩略图不存在") from exc
+    previous = f'<a href="?page={page - 1}">上一页</a>' if page > 1 else ""
+    following = f'<a href="?page={page + 1}">下一页</a>' if page < total else ""
+    content = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+               '<meta name="viewport" content="width=device-width,initial-scale=1">'
+               '<title>场景缩略图</title><style>body{font:16px system-ui;margin:24px}'
+               'img{display:block;max-width:100%;height:auto;margin:16px 0}nav a{margin-right:16px}</style>'
+               f'<h1>场景缩略图</h1><nav>{previous}{following}第 {page} / {total} 页</nav>'
+               f'<img src="data:image/jpeg;base64,{sheet}" alt="带编号和时间的场景缩略图"></html>')
+    return HTMLResponse(content, headers={"Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'"})
 
 
 @secured.get("/tasks/{job_id}/preview/{filename}")

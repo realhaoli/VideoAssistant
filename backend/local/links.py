@@ -10,6 +10,8 @@ from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.postprocessor.ffmpeg import FFmpegMergerPP
 from yt_dlp.utils import PagedList, extract_attributes, get_element_html_by_class
 
+from .official_media import OfficialAutoIE, PublicPageMediaIE
+
 
 COLLECTIONS = {"playlist", "multi_video", "compat_list"}
 MAX_LINK_ENTRIES = 30
@@ -97,7 +99,9 @@ class LinkDownloader(YoutubeDL):
 
     def add_default_info_extractors(self):
         self.add_info_extractor(BydReplayListIE())
+        self.add_info_extractor(OfficialAutoIE())
         super().add_default_info_extractors()
+        self.add_info_extractor(PublicPageMediaIE())
 
     def save_cookies(self):
         if not self.preview:

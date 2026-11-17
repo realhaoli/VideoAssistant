@@ -18,6 +18,9 @@ ORIGINAL_DRAFT = Intelligence.draft
 
 
 def prepare(tmp_path, monkeypatch, modes, source='upload', native=True):
+    monkeypatch.setattr(pipeline.scene_index, 'build', lambda *args: None)
+    monkeypatch.setattr(pipeline, '_final_figure', lambda folder, path, body, sample, choice, engine, check:
+                        (choice['candidate']['path'].read_bytes(), choice.get('caption', ''), False))
     monkeypatch.setattr('local.jobs.load', lambda:{})
     jobs = JobStore(tmp_path/'tasks')
     task = jobs.create(modes=modes, source={'type':source,'filename':'source.mp4','url':'https://example.test/video'},
@@ -276,7 +279,7 @@ def test_long_chapter_reuses_completed_figures_after_a_later_segment_fails(tmp_p
     assert len(json.loads((folder/'image-selections.json').read_text(encoding='utf-8'))) == 4
     report = (folder / 'output' / 'illustrated.md').read_text(encoding='utf-8')
     for part, cue in enumerate(cues, 1):
-        assert cue['text'] + f'\n\n![技术画面](image/chapter-01-{part:02d}.jpg)' in report
+        assert cue['text'] + f'\n\n![技术画面](image/chapter-01-{part:02d}.png)' in report
 
 
 @pytest.mark.parametrize('vision_unavailable', [False, True])

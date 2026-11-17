@@ -124,7 +124,9 @@ def download_options(folder, best=False, audio=False):
         format="bestaudio/best" if audio else ("bv*+ba/b" if best else "bv*[height<=1080]+ba/b[height<=?1080]"),
         outtmpl=str(folder / "source.%(ext)s"), merge_output_format="mp4",
         format_sort=["res", "ext:mp4:m4a"],
-        retries=3, fragment_retries=3, continuedl=True,
+        retries=3, fragment_retries=5, continuedl=True, skip_unavailable_fragments=False,
+        retry_sleep_functions={'fragment': lambda attempt: min(8, 2 ** min(attempt - 1, 3))},
+        concurrent_fragment_downloads=setting('DOWNLOAD_FRAGMENT_CONCURRENCY', 16, high=16),
     )
 
 
@@ -222,6 +224,7 @@ def _download(url, folder, *, best, audio, check, progress, resource_id):
     with reserve_disk(folder) as disk:
         received = {}
         last_check = 0
+        hook_lock = threading.Lock()
 
         def hook(event):
             nonlocal last_check
@@ -231,18 +234,19 @@ def _download(url, folder, *, best, audio, check, progress, resource_id):
             total = event.get('total_bytes') or event.get('total_bytes_estimate')
             downloaded = event.get('downloaded_bytes') or 0
             stream = event.get('filename') or event.get('tmpfilename') or 'source'
-            new_stream = stream not in received
-            received[stream] = max(received.get(stream, 0), downloaded)
-            aggregate = sum(received.values())
-            if aggregate + max(0, (total or downloaded) - downloaded) > maximum:
-                raise ValueError('下载超过 MAX_DOWNLOAD_MB 限制，已保留可续传文件')
-            remaining = max(0, (total or downloaded) - downloaded)
-            if new_stream or event['status'] == 'finished' or aggregate - last_check >= 4 * 1024**2:
-                disk.resize(max(remaining, 4 * 1024**2) if event['status'] == 'downloading' else 0)
-                ensure_disk(folder)
-                last_check = aggregate
-            if total and event['status'] == 'downloading':
-                progress(min(99, int(downloaded * 100 / total)))
+            with hook_lock:
+                new_stream = stream not in received
+                received[stream] = max(received.get(stream, 0), downloaded)
+                aggregate = sum(received.values())
+                remaining = max(0, (total or downloaded) - received[stream])
+                if aggregate + remaining > maximum:
+                    raise ValueError('下载超过 MAX_DOWNLOAD_MB 限制，已保留可续传文件')
+                if new_stream or event['status'] == 'finished' or aggregate - last_check >= 4 * 1024**2:
+                    disk.resize(max(remaining, 4 * 1024**2) if event['status'] == 'downloading' else 0)
+                    ensure_disk(folder)
+                    last_check = aggregate
+                if total and event['status'] == 'downloading':
+                    progress(min(99, int(received[stream] * 100 / total)))
 
         def postprocess(event):
             check()
@@ -565,13 +569,48 @@ def word_cues(words):
     return cues
 
 
-def frame(path, timestamp, target, check):
+def frame(path, timestamp, target, check, *, native=False):
     with FRAMES.slot(check):
         check()
+        scale = [] if native else ["-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "2"]
         ffmpeg_command(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(path),
-                 "-frames:v", "1", "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "2", str(target)], check, timeout=60)
+                        "-map", "0:V:0", "-frames:v", "1", *scale, str(target)], check, timeout=60)
     if not target.exists() or target.stat().st_size < 100:
         raise ValueError("该位置无法抽取视频画面")
+
+
+def focus_frame(source, target, box, *, annotate=False):
+    from PIL import Image, ImageDraw, ImageOps
+
+    if (not isinstance(box, list) or len(box) != 4
+            or not all(type(value) in (int, float) and 0 <= value <= 1 for value in box)):
+        return False
+    x1, y1, x2, y2 = box
+    if x2 - x1 < .025 or y2 - y1 < .025 or (x2 - x1) * (y2 - y1) > .8:
+        return False
+    with Image.open(source) as raw:
+        image = raw.convert("RGB")
+        width, height = image.size
+        bounds = [round(value * size) for value, size in zip(box, (width, height, width, height))]
+        pad_x = max(width * .04, (bounds[2] - bounds[0]) * .25)
+        pad_y = max(height * .04, (bounds[3] - bounds[1]) * .25)
+        left, top = max(0, round(bounds[0] - pad_x)), max(0, round(bounds[1] - pad_y))
+        right, bottom = min(width, round(bounds[2] + pad_x)), min(height, round(bounds[3] + pad_y))
+        image = image.crop((left, top, right, bottom))
+        factor = max(1, min(2, 1920 / max(image.size)))
+        if factor > 1:
+            image = image.resize(tuple(round(size * factor) for size in image.size), Image.Resampling.LANCZOS)
+        if annotate:
+            image = ImageOps.expand(image, border=8, fill="white")
+            draw = ImageDraw.Draw(image)
+            x1, y1, x2, y2 = [8 + round((value - offset) * factor)
+                              for value, offset in zip(bounds, (left, top, left, top))]
+            draw.rectangle((x1, y1, x2, y2), outline="#dc2626", width=3)
+            badge_y = max(8, y1 - 20)
+            draw.rectangle((x1, badge_y, x1 + 20, badge_y + 19), fill="#dc2626")
+            draw.text((x1 + 6, badge_y + 3), "1", fill="white")
+        image.save(target, "PNG")
+    return True
 
 
 def image_quality(path):
@@ -627,7 +666,8 @@ def scene_samples(path, start, end, check):
     return [representative(scene) for scene in scenes]
 
 
-def candidates(path, chapter, output, index, used, check, *, progress=None, exclude_times=()):
+def candidates(path, chapter, output, index, used, check, *, progress=None, exclude_times=(),
+               catalog=None, scenes=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tempfile import TemporaryDirectory
 
@@ -636,6 +676,7 @@ def candidates(path, chapter, output, index, used, check, *, progress=None, excl
     duration = max(.1, end - start)
     stat = path.stat()
     source_key = cache_fingerprint(path.name, stat.st_size, stat.st_mtime_ns)[:16]
+    indexed = {}
 
     def eligible_times(times, start, end):
         bounded = (round(min(end, max(start, time)), 3) for time in times)
@@ -652,10 +693,17 @@ def candidates(path, chapter, output, index, used, check, *, progress=None, excl
                     staged = Path(directory) / target.name
                     frame(path, timestamp, staged, check)
                     replace_file(staged, target)
-            quality = image_quality(target)
+            scene = indexed.get(timestamp)
+            if catalog is None:
+                quality = image_quality(target)
+            else:
+                from PIL import Image
+                from .scene_index import frame_metrics
+                with Image.open(target) as image:
+                    quality, _ = frame_metrics(image)
             fingerprint = image_hash(target)
             if not duplicate_frame(fingerprint, used):
-                return dict(path=target, time=timestamp, quality=quality, hash=fingerprint)
+                return dict(path=target, time=timestamp, quality=quality, hash=fingerprint, scene=scene)
         except (RuntimeError, TimeoutError, ValueError):
             check()
             return None
@@ -663,7 +711,15 @@ def candidates(path, chapter, output, index, used, check, *, progress=None, excl
     anchor = chapter.get("evidence_time")
     scene_times = set()
     new_scene_times = set()
-    if anchor is None:
+    if catalog is not None:
+        selected = scenes if scenes is not None else catalog.local(
+            anchor, chapter['search_radius'], chapter.get('previous_search_radius'),
+            chapter.get('figure_kind'), exclude_times)
+        indexed = {round(item['time'], 3): item for item in selected}
+        samples = list(indexed)
+        # Search beyond chapter boundaries when the scene retrieval found a match.
+        start, latest = 0, max(samples, default=0)
+    elif anchor is None:
         samples = [min(latest, start + duration * fraction) for fraction in (.04, .17, .30, .43, .56, .69, .82, .94)]
     else:
         radius = chapter.get("search_radius", 8)
@@ -702,8 +758,10 @@ def candidates(path, chapter, output, index, used, check, *, progress=None, excl
             images[futures[future]] = future.result()
             if progress:
                 progress(completed * 100 / len(samples))
-    ranked = sorted((image for image in images if image and image["quality"] > .4),
-                    key=lambda image: (image["time"] in new_scene_times, image["time"] in scene_times, image["quality"]),
+    ranked = sorted((image for image in images if image and image["quality"] > (0 if catalog is not None else .4)),
+                    key=lambda image: ((image["scene"] is not None and chapter.get('figure_kind') == "parameter"
+                                         and image["scene"]["card"]),
+                                        image["time"] in new_scene_times, image["time"] in scene_times, image["quality"]),
                     reverse=True)
     diverse = []
     hashes = []

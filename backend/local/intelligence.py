@@ -20,6 +20,27 @@ MIN_PLANNING_RETRY_SECONDS = 180
 MIN_PLANNING_RETRY_CHARS = 480
 SCENARIOS = {"auto": "根据内容判断场景", "product": "新品发布会：定位、亮点、参数、对比、上市信息", "technical": "技术讲解：背景、原理、实现、实验、限制", "research": "调研汇报：问题、方法、证据、发现、建议", "lecture": "专家讲座：问题、论点、论据、结论、启示"}
 
+FIGURE_ACCELERATION = re.compile(r"0\s*[-–—到至~～]\s*60(?!\d)|\b0\s*to\s*60(?!\d)", re.I)
+FIGURE_DURATION_DIGITS = str.maketrans("零一二两三四五六七八九", "01223456789")
+
+
+def figure_numbers(text):
+    normalized = re.sub(r"(?<=\d)[,，\u202f](?=\d{3}(?:\D|$))", "", str(text))
+    normalized = re.sub(r"(?<![零一二两三四五六七八九十百千点\d])[零一二两三四五六七八九]秒",
+                        lambda match: match[0].translate(FIGURE_DURATION_DIGITS), normalized)
+    return {number.rstrip('0').rstrip('.') if '.' in number and number.count('.') == 1 else number
+            for number in re.findall(r"\d+(?:[.,]\d+)*", normalized)}
+
+
+def visible_parameter(body, text):
+    if not isinstance(text, str):
+        return False
+    expected = figure_numbers(body)
+    actual = figure_numbers(text)
+    if FIGURE_ACCELERATION.search(body):
+        return bool(FIGURE_ACCELERATION.search(text) and (expected & actual) - {"0", "60"})
+    return bool(expected & actual)
+
 
 class ModelJSONError(ValueError):
     def __init__(self, message, *, truncated=False):
@@ -721,8 +742,12 @@ class Intelligence:
                   "只有对应关系清晰且有说明价值才给80分或以上。parameter 必须在 visible_text 逐字抄录正文中同一参数的可读数值和名称或单位。"
                   "如果正文同时介绍产品结构、动作和参数，能直接展示其中一个具体要点即可。画面清楚展示对应实物或功能、但没有可读数值时，按 product 或 demo 评估，并用无数值图注说明实际可见的内容。"
                   "图注使用简体中文，任何数字都必须同时出现在正文和画面可读文字中。"
-                  "仅返回JSON {\"rankings\":[{\"index\":0,\"score\":90,\"kind\":\"parameter\",\"reason\":\"可见内容与对应的正文要点\",\"caption\":\"中文图注\",\"visible_text\":\"可读的原画面文字\"}]}。"
+                  "仅返回JSON {\"rankings\":[{\"index\":0,\"score\":90,\"kind\":\"parameter\",\"reason\":\"可见内容与对应的正文要点\",\"caption\":\"中文图注\",\"visible_text\":\"可读的原画面文字\"}]}。" +
+                  ("\n本要点所需画面类型：" + chapter["figure_kind"] +
+                   "。只能选择符合此类型且直接显示对应内容的画面。参数必须来自屏幕、仪表或原画中的数据页，口播字幕不能作为可见参数。"
+                   if chapter.get("figure_kind") else "") +
                   "\n章节配图目标：" + str(chapter.get("visual_query", chapter["title"]))[:300] +
+                  ("\n配图偏好（须符合前面的证据和画质规则）：" + chapter["visual_rules"] if chapter.get("visual_rules") else "") +
                   "\n定位字幕：" + str(chapter.get("evidence_text", ""))[:500] + "\n正文：" + text +
                   "\n图片时刻（秒）：" + str([round(c["time"], 2) for _, c in items]))
             try:
@@ -743,26 +768,61 @@ class Intelligence:
                         return review(items, compact)
                 raise
         ranked = []
-        def numbers(text):
-            text = re.sub(r"(?<=\d)[,，\u202f](?=\d{3}(?:\D|$))", "", text)
-            return set(re.findall(r"\d+(?:[.,]\d+)*", text))
-
-        body_numbers = numbers(body)
+        body_numbers = figure_numbers(body)
         for entry in review(list(enumerate(candidates)), body):
             kind = entry.get('kind')
-            visible_numbers = numbers(str(entry.get('visible_text') or ''))
+            visible_numbers = figure_numbers(entry.get('visible_text') or '')
             if (entry['score'] < 80 or kind not in ('parameter', 'product', 'demo')
+                    or chapter.get('figure_kind') not in (None, kind)
                     or not isinstance(entry.get('reason'), str) or not entry['reason'].strip()
-                    or kind == 'parameter' and not (body_numbers & visible_numbers)):
+                    or kind == 'parameter' and not visible_parameter(body, entry.get('visible_text'))):
                 continue
             index = entry['index']
             if index not in [r['index'] for r in ranked]:
                 caption = str(entry.get('caption', ''))
-                if numbers(caption) - (body_numbers & visible_numbers):
-                    caption = ('与本段对应的原视频画面' if numbers(chapter['title'])
+                if figure_numbers(caption) - (body_numbers & visible_numbers):
+                    caption = ('与本段对应的原视频画面' if figure_numbers(chapter['title'])
                                else '原视频画面 · ' + chapter['title'])
                 ranked.append(dict(entry, caption=caption, candidate=candidates[index]))
         return sorted(ranked, key=lambda entry:entry.get('score',0), reverse=True)
+
+    def shortlist_scenes(self, sheet, scenes, body, kind):
+        times = {scene['id']: scene for scene in scenes}
+        prompt = (
+            "图中每格是一个视频场景的缩略图，底部第一个数字是场景编号。根据正文找可能包含对应页面、产品部件或演示动作的场景。"
+            "这是初筛。参数小字看不清时可保留疑似参数页。按相关性返回最多4个不同编号，均不合适时返回空。"
+            '只返回 JSON {"ids":[编号]}。\n'
+            f"候选编号：{list(times)}\n需要的画面：{kind or '产品、参数或演示'}\n正文：{body[:2200]}")
+        result = self.chat(prompt, visual=[sheet], json_result=True,
+                           system="根据图像找到待核验的候选场景。只输出 JSON。", max_tokens=600)
+        if not isinstance(result, dict) or not isinstance(result.get('ids'), list):
+            raise ModelJSONError("场景初筛结果无效")
+        ids = dict.fromkeys(item for item in result['ids'][:4] if type(item) is int and item in times)
+        return [times[index] for index in ids]
+
+    def verify_figure(self, path, body, chapter, choice, *, request_region=False):
+        kind = chapter.get('figure_kind') or choice['kind']
+        prompt = (
+            "独立核验这一张最终截图。图注中的每个具体说法都必须能从画面与正文支持。只核验画面真正显示的对象、页面或动作。"
+            "参数图须读到对应的指标、值、单位，逐字抄入 visible_text，忽略视频口播字幕和后加的红色编号。"
+            "若提到方向、测试状态、材料或机理，画面无法直接证明时只描述可见对象。错页、错部件、无关画面返回 accepted=false。"
+            "可提供更准确的简体中文图注。"
+            '只返回 JSON {"accepted":true,"caption":"简体中文图注","visible_text":"画面可读文字"}。'
+            + ("如能明确定位一个关键部件或参数，可增加 box 字段 [左,上,右,下]，按整图宽高归一化到 0–1，圈住实际可见区域。"
+               "定位不确定时 box 为 null。" if request_region else "")
+            + f"\n画面类型：{kind}\n正文：{body[:2600]}\n待核验图注：{choice['caption'][:400]}")
+        result = self.chat(prompt, visual=[path], json_result=True, max_tokens=1200,
+                           system="你负责复核汇报截图与图注的证据。只输出 JSON。")
+        if not isinstance(result, dict) or result.get('accepted') is not True:
+            return None
+        caption = result.get('caption')
+        if not isinstance(caption, str) or not caption.strip():
+            return None
+        body_numbers = figure_numbers(body)
+        visible = figure_numbers(result.get('visible_text', ''))
+        if (kind == 'parameter' and not visible_parameter(body, result.get('visible_text'))) or figure_numbers(caption) - (body_numbers & visible):
+            return None
+        return result
 
     def draft(self, chapter, segments, options, evidence="", *, source_language="zh"):
         from_source = source_language != "zh"
@@ -919,7 +979,7 @@ class Intelligence:
             current = result
         raise ValueError("摘要压缩超过安全轮数，已保存分段结果，请检查模型输出后继续")
 
-    def overview(self, chapters):
+    def overview(self, chapters, *, writing=""):
         from .exports import grounded_body
         materials = [{"title": chapter["title"], "body": self.digest(body)} for chapter, body in chapters]
         material = self.digest(json.dumps(materials, ensure_ascii=False))
@@ -931,7 +991,8 @@ class Intelligence:
 
         for target in (3500, 1800, 900, 450):
             try:
-                value = self.report_json("汇报摘要", OVERVIEW_RULES + "\n最终章节正文：" + material,
+                preference = "\n写作偏好（保持指定 JSON 字段）：" + writing if writing else ""
+                value = self.report_json("汇报摘要", OVERVIEW_RULES + preference + "\n最终章节正文：" + material,
                                          valid_response, system=OVERVIEW_SYSTEM, max_tokens=2500)
                 break
             except ModelLimitError:
